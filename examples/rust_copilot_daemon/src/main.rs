@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use walkdir::WalkDir;
 
@@ -32,6 +32,7 @@ const SYMBOL_VECTOR_NAME: &str = "symbol";
 const DOCS_VECTOR_NAME: &str = "docs";
 const SIGNATURE_VECTOR_NAME: &str = "signature";
 const BODY_VECTOR_NAME: &str = "body";
+const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Runtime configuration shared across JSON-RPC and MCP layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +131,10 @@ struct RustItemDoc {
     signature: String,
     /// Joined doc comments directly above the item.
     docs: String,
+    /// Hover payload extracted from rust-analyzer.
+    hover_summary: String,
+    /// Signature help summary extracted from rust-analyzer.
+    signature_help: String,
     /// Short source excerpt for additional context.
     body_excerpt: String,
     /// Inclusive start line (1-based).
@@ -228,6 +233,8 @@ struct App {
     state: Arc<RwLock<State>>,
     /// Bound service clients.
     services: Arc<RwLock<Services>>,
+    /// Shared persistent rust-analyzer session manager.
+    ra_manager: Arc<Mutex<RaSessionManager>>,
     /// Work queue sender for indexing operations.
     dirty_tx: mpsc::Sender<DirtyEvent>,
     /// Global stop signal broadcaster.
@@ -241,6 +248,223 @@ enum DirtyEvent {
     Index(PathBuf),
     /// Delete file chunks from in-memory view.
     Delete(PathBuf),
+}
+
+struct RaSessionManager {
+    workspace_root: Option<PathBuf>,
+    session: Option<RaLspSession>,
+}
+
+impl RaSessionManager {
+    fn new() -> Self {
+        Self {
+            workspace_root: None,
+            session: None,
+        }
+    }
+
+    async fn reset(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            let _ = session.shutdown().await;
+        }
+        self.workspace_root = None;
+    }
+
+    async fn ensure_session(&mut self, workspace_root: &Path) -> Result<&mut RaLspSession> {
+        if self.workspace_root.as_deref() != Some(workspace_root) {
+            self.reset().await;
+        }
+
+        if self.session.is_none() {
+            self.session = Some(RaLspSession::start(workspace_root).await?);
+            self.workspace_root = Some(workspace_root.to_path_buf());
+        }
+
+        self.session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("rust-analyzer session unavailable"))
+    }
+
+    async fn extract_symbol_docs(
+        &mut self,
+        workspace_root: &Path,
+        workspace_id: &str,
+        file_path_abs: &Path,
+        file_path_rel: &str,
+        file_uri: &str,
+        content: &str,
+    ) -> Result<Vec<RustItemDoc>> {
+        let file_uri = if file_uri.is_empty() {
+            path_to_file_uri(file_path_abs)?
+        } else {
+            file_uri.to_string()
+        };
+
+        let session = self.ensure_session(workspace_root).await?;
+        session.sync_document(&file_uri, content).await?;
+        let result = session
+            .request(
+                "textDocument/documentSymbol",
+                json!({
+                    "textDocument": { "uri": file_uri }
+                }),
+            )
+            .await?;
+        let mut docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
+        enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs).await?;
+        Ok(docs)
+    }
+
+    async fn close_document(&mut self, workspace_root: &Path, file_uri: &str) {
+        if self.workspace_root.as_deref() != Some(workspace_root) {
+            return;
+        }
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.close_document(file_uri).await;
+        }
+    }
+}
+
+struct RaLspSession {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    next_id: i64,
+    open_doc_versions: HashMap<String, i64>,
+}
+
+impl RaLspSession {
+    async fn start(workspace_root: &Path) -> Result<Self> {
+        let mut child = Command::new("rust-analyzer")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn rust-analyzer process")?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .context("failed to acquire rust-analyzer stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to acquire rust-analyzer stdout")?;
+        let mut session = Self {
+            child,
+            stdin,
+            reader: BufReader::new(stdout),
+            next_id: 1,
+            open_doc_versions: HashMap::new(),
+        };
+
+        let workspace_uri = path_to_file_uri(workspace_root)?;
+        let _ = session
+            .request(
+                "initialize",
+                json!({
+                    "processId": null,
+                    "rootUri": workspace_uri,
+                    "capabilities": {}
+                }),
+            )
+            .await?;
+
+        session.notify("initialized", json!({})).await?;
+        Ok(session)
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        write_lsp_message(
+            &mut self.stdin,
+            &json!({
+                "jsonrpc":"2.0",
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let req_id = self.next_id;
+        self.next_id += 1;
+
+        tokio::time::timeout(LSP_REQUEST_TIMEOUT, async {
+            write_lsp_message(
+                &mut self.stdin,
+                &json!({
+                    "jsonrpc":"2.0",
+                    "id": req_id,
+                    "method": method,
+                    "params": params,
+                })
+                .to_string(),
+            )
+            .await?;
+            let response = read_lsp_response_for_id(&mut self.reader, req_id).await?;
+            Ok::<Value, anyhow::Error>(response.get("result").cloned().unwrap_or(Value::Null))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("rust-analyzer request timed out: {method}"))?
+    }
+
+    async fn sync_document(&mut self, file_uri: &str, content: &str) -> Result<()> {
+        if let Some(current) = self.open_doc_versions.get(file_uri).copied() {
+            let new_version = current + 1;
+            self.open_doc_versions
+                .insert(file_uri.to_string(), new_version);
+            self.notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {
+                        "uri": file_uri,
+                        "version": new_version,
+                    },
+                    "contentChanges": [{
+                        "text": content
+                    }]
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.open_doc_versions.insert(file_uri.to_string(), 1);
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": content
+                }
+            }),
+        )
+        .await
+    }
+
+    async fn close_document(&mut self, file_uri: &str) -> Result<()> {
+        if self.open_doc_versions.remove(file_uri).is_none() {
+            return Ok(());
+        }
+        self.notify(
+            "textDocument/didClose",
+            json!({
+                "textDocument": { "uri": file_uri }
+            }),
+        )
+        .await
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        let _ = self.request("shutdown", Value::Null).await;
+        let _ = self.notify("exit", Value::Null).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+        Ok(())
+    }
 }
 
 /// JSON-RPC request envelope.
@@ -383,6 +607,7 @@ async fn main() -> Result<()> {
         config: Arc::new(RwLock::new(config)),
         state: Arc::new(RwLock::new(State::default())),
         services: Arc::new(RwLock::new(services)),
+        ra_manager: Arc::new(Mutex::new(RaSessionManager::new())),
         dirty_tx,
         stop_tx: stop_tx.clone(),
     };
@@ -586,15 +811,19 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
 
     // Symbol-aware enrichment stage. When symbols are available, they replace
     // coarse chunk fallback docs for the same file.
-    let symbol_docs = match extract_symbol_docs_with_rust_analyzer(
-        &cfg.workspace_root,
-        &workspace_id,
-        path,
-        &file_rel,
-        &file_uri,
-        &content,
-    )
-    .await
+    let symbol_docs = match app
+        .ra_manager
+        .lock()
+        .await
+        .extract_symbol_docs(
+            &cfg.workspace_root,
+            &workspace_id,
+            path,
+            &file_rel,
+            &file_uri,
+            &content,
+        )
+        .await
     {
         Ok(docs) if !docs.is_empty() => docs,
         Ok(_) => extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
@@ -659,6 +888,14 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
 /// Removes a file's chunks from local in-memory cache.
 async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
     let cfg = app.config.read().await.clone();
+    if let Ok(file_uri) = path_to_file_uri_non_canonical(path) {
+        app.ra_manager
+            .lock()
+            .await
+            .close_document(&cfg.workspace_root, &file_uri)
+            .await;
+    }
+
     let file_rel = path
         .strip_prefix(&cfg.workspace_root)
         .unwrap_or(path)
@@ -708,6 +945,8 @@ fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<RustItemDoc> {
                 .trim()
                 .to_string(),
             docs: String::new(),
+            hover_summary: String::new(),
+            signature_help: String::new(),
             body_excerpt: chunk.text.clone(),
             start_line: chunk.start_line,
             end_line: chunk.end_line,
@@ -883,10 +1122,12 @@ fn derive_workspace_id(workspace_root: &Path) -> String {
 
 fn rust_item_search_text(doc: &RustItemDoc) -> String {
     format!(
-        "{symbol}\n{signature}\n{docs}\n{body_excerpt}\nmodule: {module}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        "{symbol}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
         symbol = doc.symbol,
         signature = doc.signature,
+        signature_help = doc.signature_help,
         docs = doc.docs,
+        hover_summary = doc.hover_summary,
         body_excerpt = doc.body_excerpt,
         module = doc.module,
         file_path = doc.file_path,
@@ -912,8 +1153,9 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
         (
             DOCS_VECTOR_NAME.to_string(),
             format!(
-                "{docs}\nsymbol: {symbol}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                "{docs}\nhover: {hover}\nsymbol: {symbol}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
                 docs = doc.docs,
+                hover = doc.hover_summary,
                 symbol = doc.symbol,
                 module = doc.module,
                 file_path = doc.file_path,
@@ -923,8 +1165,9 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
         (
             SIGNATURE_VECTOR_NAME.to_string(),
             format!(
-                "{signature}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
                 signature = doc.signature,
+                signature_help = doc.signature_help,
                 symbol = doc.symbol,
                 kind = doc.kind,
                 module = doc.module,
@@ -938,8 +1181,9 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
         vectors.insert(
             BODY_VECTOR_NAME.to_string(),
             format!(
-                "{body_excerpt}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                "{body_excerpt}\nhover: {hover}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
                 body_excerpt = doc.body_excerpt,
+                hover = doc.hover_summary,
                 symbol = doc.symbol,
                 kind = doc.kind,
                 module = doc.module,
@@ -952,133 +1196,76 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
     vectors
 }
 
-async fn extract_symbol_docs_with_rust_analyzer(
-    workspace_root: &Path,
-    workspace_id: &str,
-    file_path_abs: &Path,
-    file_path_rel: &str,
+async fn enrich_docs_with_lsp_metadata(
+    session: &mut RaLspSession,
     file_uri: &str,
-    content: &str,
-) -> Result<Vec<RustItemDoc>> {
-    tokio::time::timeout(Duration::from_secs(8), async {
-        let mut child = Command::new("rust-analyzer")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn rust-analyzer process")?;
+    docs: &mut [RustItemDoc],
+) -> Result<()> {
+    for doc in docs {
+        let line = doc.start_line.saturating_sub(1);
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("failed to acquire rust-analyzer stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("failed to acquire rust-analyzer stdout")?;
-        let mut reader = BufReader::new(stdout);
+        let hover = session
+            .request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": file_uri },
+                    "position": { "line": line, "character": 0 }
+                }),
+            )
+            .await?;
+        doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
 
-        let workspace_uri = path_to_file_uri(workspace_root)?;
-        let file_uri = if file_uri.is_empty() {
-            path_to_file_uri(file_path_abs)?
-        } else {
-            file_uri.to_string()
-        };
+        let signature_help = session
+            .request(
+                "textDocument/signatureHelp",
+                json!({
+                    "textDocument": { "uri": file_uri },
+                    "position": { "line": line, "character": 0 }
+                }),
+            )
+            .await?;
+        doc.signature_help = lsp_signature_help_to_text(&signature_help).unwrap_or_default();
+    }
 
-        write_lsp_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "processId": null,
-                    "rootUri": workspace_uri,
-                    "capabilities": {}
-                }
-            })
-            .to_string(),
-        )
-        .await?;
-        let _ = read_lsp_response_for_id(&mut reader, 1).await?;
+    Ok(())
+}
 
-        write_lsp_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc":"2.0",
-                "method":"initialized",
-                "params": {}
-            })
-            .to_string(),
-        )
-        .await?;
+fn lsp_hover_to_text(result: &Value) -> Option<String> {
+    let contents = result.get("contents")?;
+    lsp_marked_content_to_text(contents)
+}
 
-        write_lsp_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc":"2.0",
-                "method":"textDocument/didOpen",
-                "params": {
-                    "textDocument": {
-                        "uri": file_uri,
-                        "languageId": "rust",
-                        "version": 1,
-                        "text": content
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .await?;
+fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
+    let signatures = result.get("signatures")?.as_array()?;
+    let first = signatures.first()?;
+    first
+        .get("label")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_string())
+}
 
-        write_lsp_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc":"2.0",
-                "id": 2,
-                "method":"textDocument/documentSymbol",
-                "params": {
-                    "textDocument": {
-                        "uri": file_uri
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .await?;
+fn lsp_marked_content_to_text(contents: &Value) -> Option<String> {
+    if let Some(v) = contents.as_str() {
+        return Some(v.trim().to_string());
+    }
 
-        let response = read_lsp_response_for_id(&mut reader, 2).await?;
-        let result = response.get("result").cloned().unwrap_or(Value::Null);
-        let docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
+    if let Some(v) = contents.get("value").and_then(Value::as_str) {
+        return Some(v.trim().to_string());
+    }
 
-        let _ = write_lsp_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc":"2.0",
-                "id": 3,
-                "method":"shutdown",
-                "params": null
-            })
-            .to_string(),
-        )
-        .await;
-        let _ = read_lsp_response_for_id(&mut reader, 3).await;
-        let _ = write_lsp_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc":"2.0",
-                "method":"exit",
-                "params": null
-            })
-            .to_string(),
-        )
-        .await;
-        let _ = child.wait().await;
+    if let Some(items) = contents.as_array() {
+        let joined = items
+            .iter()
+            .filter_map(lsp_marked_content_to_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
 
-        Ok::<Vec<RustItemDoc>, anyhow::Error>(docs)
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("rust-analyzer symbol extraction timed out"))?
+    None
 }
 
 async fn write_lsp_message<W>(writer: &mut W, payload: &str) -> Result<()>
@@ -1146,6 +1333,26 @@ fn path_to_file_uri(path: &Path) -> Result<String> {
         .canonicalize()
         .with_context(|| format!("failed to canonicalize path {}", path.display()))?;
     let mut p = canonical.to_string_lossy().replace('\\', "/");
+    if !p.starts_with('/') {
+        p = format!("/{p}");
+    }
+    let encoded = p
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    Ok(format!("file://{encoded}"))
+}
+
+fn path_to_file_uri_non_canonical(path: &Path) -> Result<String> {
+    let raw = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory for uri conversion")?
+            .join(path)
+    };
+    let mut p = raw.to_string_lossy().replace('\\', "/");
     if !p.starts_with('/') {
         p = format!("/{p}");
     }
@@ -1226,6 +1433,8 @@ fn collect_lsp_symbol_docs(
             module: module.to_string(),
             signature,
             docs,
+            hover_summary: String::new(),
+            signature_help: String::new(),
             body_excerpt: excerpt,
             start_line,
             end_line,
@@ -1303,6 +1512,8 @@ fn extract_symbol_docs_heuristic(
             module: module.clone(),
             signature,
             docs: item_docs,
+            hover_summary: String::new(),
+            signature_help: String::new(),
             body_excerpt,
             start_line,
             end_line,
@@ -1318,8 +1529,14 @@ fn symbol_docs_to_chunks(docs: &[RustItemDoc]) -> Vec<CodeChunk> {
     docs.iter()
         .map(|doc| {
             let text = format!(
-                "symbol: {}\nkind: {}\nsignature: {}\ndocs:\n{}\n\nexcerpt:\n{}",
-                doc.symbol, doc.kind, doc.signature, doc.docs, doc.body_excerpt
+                "symbol: {}\nkind: {}\nsignature: {}\nsignature_help: {}\ndocs:\n{}\nhover:\n{}\n\nexcerpt:\n{}",
+                doc.symbol,
+                doc.kind,
+                doc.signature,
+                doc.signature_help,
+                doc.docs,
+                doc.hover_summary,
+                doc.body_excerpt
             );
             CodeChunk {
                 chunk_id: doc.id.clone(),
@@ -1509,6 +1726,8 @@ mod tests {
             module: "src::main".to_string(),
             signature: format!("fn {symbol}() {{}}"),
             docs: String::new(),
+            hover_summary: String::new(),
+            signature_help: String::new(),
             body_excerpt: excerpt.to_string(),
             start_line: 1,
             end_line: 3,
@@ -1634,6 +1853,8 @@ pub struct Thing {
             module: "src::lib".to_string(),
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
+            hover_summary: "hover add".to_string(),
+            signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             end_line: 3,
@@ -1656,6 +1877,8 @@ pub struct Thing {
             module: "src::lib".to_string(),
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
+            hover_summary: "hover add".to_string(),
+            signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             end_line: 3,

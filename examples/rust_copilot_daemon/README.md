@@ -87,7 +87,9 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 - JSON-RPC returns `{protocol_version, daemon_version}` on initialize.
 - MCP responses include `schema_version`.
 - HTTP binds only to `127.0.0.1`.
+- rust-analyzer integration is session-based (persistent process per workspace) with `didOpen`/`didChange`/`didClose`.
+- Symbol extraction is enriched with LSP `documentSymbol`, `hover`, and `signatureHelp` data before vector upsert.
 
 ## Current limitation
 
-`file.deleted` removes chunks from in-memory cache; physical deletion in Qdrant is not yet implemented in this example skeleton.
+Advanced cross-file graph extraction (`references`, `implementations`, type graph edges) is not yet persisted as a dedicated relation index.

@@ -164,6 +164,8 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         state.queue_depth = 0;
         state.indexing_in_progress = false;
         state.last_error = None;
+        drop(state);
+        app.ra_manager.lock().await.reset().await;
     }
 
     Ok(json!({
@@ -246,6 +248,9 @@ async fn handle_workspace_renamed(
     if cfg.workspace_root == Path::new(&params.old_path) {
         cfg.workspace_root = PathBuf::from(params.new_path);
         cfg.workspace_id = derive_workspace_id(&cfg.workspace_root);
+        drop(cfg);
+        app.ra_manager.lock().await.reset().await;
+        return Ok(json!({"ok": true}));
     }
 
     Ok(json!({"ok": true}))
