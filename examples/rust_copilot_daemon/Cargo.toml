@@ -1,0 +1,15 @@
+[package]
+name = "rust-copilot-daemon"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "fs", "process"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+walkdir = { workspace = true }
+autoagents-core = { workspace = true }
+autoagents-llm = { workspace = true, features = ["ollama"] }
+autoagents-qdrant = { workspace = true }

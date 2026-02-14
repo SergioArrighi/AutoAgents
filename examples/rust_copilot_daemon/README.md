@@ -1,0 +1,93 @@
+# Rust Copilot Daemon (Example)
+
+Agentic co-pilot daemon dedicated to Rust development.
+
+This example shows a **single Rust process** with two planes:
+
+- JSON-RPC over stdio (sync/ingestion plane, for VS Code extension sidecar events)
+- MCP-style HTTP tool surface on localhost (query/interaction plane for agent/chat)
+
+## Stack
+
+- AutoAgents framework
+- Ollama
+- Qdrant
+- Docker
+- rust-analyzer + VSCode integration target
+
+## Models
+
+- LLM: `gpt-oss:20b`
+- Embeddings: `dengcao/Qwen3-Embedding-8B:Q4_K_M`
+
+## Run infra (Docker)
+
+```bash
+docker compose -f examples/rust_copilot_daemon/docker-compose.yml up -d
+```
+
+Then pull models in Ollama:
+
+```bash
+ollama pull gpt-oss:20b
+ollama pull dengcao/Qwen3-Embedding-8B:Q4_K_M
+```
+
+## Run daemon
+
+```bash
+cargo run -p rust-copilot-daemon
+```
+
+At startup it prints MCP endpoint, for example:
+
+```text
+rust-copilot-daemon started: jsonrpc=stdio mcp=http://127.0.0.1:43891 schema_version=2026-02-10
+```
+
+## JSON-RPC methods (stdio)
+
+Input format: newline-delimited JSON-RPC 2.0 requests.
+
+- `initialize({ workspaceRoot, qdrantUrl, collection, config })`
+- `scan.full({ globs, exclude, respectGitignore })`
+- `file.changed({ path, version?, reason? })`
+- `file.deleted({ path })`
+- `workspace.renamed({ oldPath, newPath })`
+- `status()`
+- `shutdown()`
+
+Example:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspaceRoot":"/path/to/repo"}}
+```
+
+## MCP-style tool routes (localhost HTTP)
+
+- `GET /mcp/tools`
+- `GET /mcp/tools/index_status`
+- `POST /mcp/tools/search_code`
+- `POST /mcp/tools/get_file_chunks`
+- `POST /mcp/tools/get_symbol_context`
+- `POST /mcp/tools/explain_relevance`
+
+Example:
+
+```bash
+curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
+  -H 'content-type: application/json' \
+  -d '{"query":"trait ToolT","top_k":5}'
+```
+
+## Architecture notes
+
+- Ingestion is queue-based, with debounce + batch processing for file-change storms.
+- Query plane is read-only and returns `indexing_in_progress`.
+- JSON-RPC returns `{protocol_version, daemon_version}` on initialize.
+- MCP responses include `schema_version`.
+- HTTP binds only to `127.0.0.1`.
+
+## Current limitation
+
+`file.deleted` removes chunks from in-memory cache; physical deletion in Qdrant is not yet implemented in this example skeleton.
