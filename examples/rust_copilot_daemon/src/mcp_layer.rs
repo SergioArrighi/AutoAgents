@@ -82,8 +82,10 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
             },
             "tools": [
                 "search_code",
+                "search_relations",
                 "get_file_chunks",
                 "get_symbol_context",
+                "get_symbol_relations",
                 "explain_relevance",
                 "index_status"
             ]
@@ -93,6 +95,12 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
             Ok(req) => handle_mcp_search_code(app, req).await,
             Err(err) => Err(err),
         },
+        ("POST", "/mcp/tools/search_relations") => {
+            match parse_json_body::<SearchRelationsRequest>(body) {
+                Ok(req) => handle_mcp_search_relations(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
         ("POST", "/mcp/tools/get_file_chunks") => {
             match parse_json_body::<GetFileChunksRequest>(body) {
                 Ok(req) => handle_mcp_get_file_chunks(app, req).await,
@@ -102,6 +110,12 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
         ("POST", "/mcp/tools/get_symbol_context") => {
             match parse_json_body::<SymbolContextRequest>(body) {
                 Ok(req) => handle_mcp_get_symbol_context(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
+        ("POST", "/mcp/tools/get_symbol_relations") => {
+            match parse_json_body::<SymbolRelationsRequest>(body) {
+                Ok(req) => handle_mcp_get_symbol_relations(app, req).await,
                 Err(err) => Err(err),
             }
         }
@@ -237,6 +251,67 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
     }))
 }
 
+/// Implements `search_relations` using semantic ranking from relation store.
+async fn handle_mcp_search_relations(
+    app: App,
+    req: SearchRelationsRequest,
+) -> Result<Value, RpcError> {
+    let top_k = req.top_k.unwrap_or(8).max(1);
+    let vector_name = req
+        .vector_name
+        .clone()
+        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let semantic = {
+        let services = app.services.read().await.clone();
+        let request = VectorSearchRequest::builder()
+            .query(req.query.clone())
+            .query_vector_name(vector_name.clone())
+            .samples(top_k as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid relation search request: {err}"),
+            })?;
+
+        services
+            .relation_store
+            .top_n::<SymbolRelationDoc>(request)
+            .await
+            .map_err(|err| RpcError {
+                code: 500,
+                message: format!("semantic relation search failed: {err}"),
+            })?
+    };
+
+    let rows = semantic
+        .into_iter()
+        .filter_map(|(score, _, item)| {
+            if matches_relation_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                Some((score, item))
+            } else {
+                None
+            }
+        })
+        .take(top_k)
+        .collect::<Vec<_>>();
+
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": item,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 /// Lexical scoring component used by `search_code`.
 pub(super) fn lexical_search(
     items_by_file: HashMap<String, Vec<RustItemDoc>>,
@@ -302,6 +377,41 @@ fn matches_filters(
     true
 }
 
+fn matches_relation_filters(
+    item: &SymbolRelationDoc,
+    filters: Option<&RelationSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(kind) = &filters.relation_kind
+        && item.relation_kind != *kind
+    {
+        return false;
+    }
+    if let Some(source_file_path) = &filters.source_file_path
+        && !item.source_file_path.contains(source_file_path)
+    {
+        return false;
+    }
+    if let Some(target_file_path) = &filters.target_file_path
+        && !item.target_file_path.contains(target_file_path)
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Implements `get_file_chunks` tool.
 async fn handle_mcp_get_file_chunks(
     app: App,
@@ -354,6 +464,46 @@ async fn handle_mcp_get_symbol_context(
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
         "locations": locations,
+    }))
+}
+
+/// Implements `get_symbol_relations` tool.
+async fn handle_mcp_get_symbol_relations(
+    app: App,
+    req: SymbolRelationsRequest,
+) -> Result<Value, RpcError> {
+    let needle = req.symbol.to_lowercase();
+    let relation_kind = req.relation_kind.as_deref();
+    let state = app.state.read().await;
+    let mut relations = Vec::new();
+
+    for (file_path, items) in &state.relations_by_file {
+        if let Some(filter_path) = &req.file_path
+            && filter_path != file_path
+        {
+            continue;
+        }
+
+        for item in items {
+            if let Some(kind) = relation_kind
+                && item.relation_kind != kind
+            {
+                continue;
+            }
+            let search_text = relation_search_text(item).to_lowercase();
+            if search_text.contains(&needle) {
+                relations.push(json!({
+                    "file_path": file_path,
+                    "item": item,
+                }));
+            }
+        }
+    }
+
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "relations": relations,
     }))
 }
 

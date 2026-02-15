@@ -33,6 +33,10 @@ const DOCS_VECTOR_NAME: &str = "docs";
 const SIGNATURE_VECTOR_NAME: &str = "signature";
 const BODY_VECTOR_NAME: &str = "body";
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const LSP_HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+const LSP_CONTENT_MODIFIED_RETRIES: usize = 2;
+const BULK_SCAN_QUEUE_DEPTH_THRESHOLD: usize = 32;
+const BULK_SCAN_REQUEST_PAUSE_MS: u64 = 2;
 
 /// Runtime configuration shared across JSON-RPC and MCP layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +49,8 @@ struct RuntimeConfig {
     qdrant_url: String,
     /// Qdrant collection name for code chunks.
     qdrant_collection: String,
+    /// Qdrant collection name for cross-file symbol relations.
+    qdrant_relation_collection: String,
     /// Optional Qdrant API key.
     qdrant_api_key: Option<String>,
     /// Ollama endpoint URL.
@@ -66,6 +72,8 @@ impl Default for RuntimeConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:6334".to_string()),
             qdrant_collection: std::env::var("QDRANT_COLLECTION")
                 .unwrap_or_else(|_| "rust_copilot_chunks".to_string()),
+            qdrant_relation_collection: std::env::var("QDRANT_RELATION_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_relations".to_string()),
             qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
@@ -151,6 +159,41 @@ impl Embed for RustItemDoc {
     }
 }
 
+/// Cross-file relation extracted from rust-analyzer symbol graph APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SymbolRelationDoc {
+    /// Stable id used for incremental upserts/deletes.
+    id: String,
+    /// Workspace identity for query-time isolation.
+    workspace_id: String,
+    /// Relation kind (references, implementations).
+    relation_kind: String,
+    /// Source symbol id in the symbol index.
+    source_symbol_id: String,
+    /// Source symbol name.
+    source_symbol: String,
+    /// Source file path.
+    source_file_path: String,
+    /// Source uri.
+    source_uri: String,
+    /// Target file path.
+    target_file_path: String,
+    /// Target uri.
+    target_uri: String,
+    /// Target line range (1-based inclusive).
+    target_start_line: usize,
+    target_end_line: usize,
+    /// Optional target snippet for retrieval quality.
+    target_excerpt: String,
+}
+
+impl Embed for SymbolRelationDoc {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
+        embedder.embed(relation_search_text(self));
+        Ok(())
+    }
+}
+
 /// Snapshot returned by status endpoints.
 #[derive(Debug, Clone, Serialize)]
 struct StatusSnapshot {
@@ -181,6 +224,8 @@ struct State {
     chunks_by_file: HashMap<String, Vec<CodeChunk>>,
     /// Local in-memory view of indexed symbol docs by file path.
     rust_items_by_file: HashMap<String, Vec<RustItemDoc>>,
+    /// Local in-memory view of indexed relations by source file path.
+    relations_by_file: HashMap<String, Vec<SymbolRelationDoc>>,
     /// Count of pending indexing events.
     queue_depth: usize,
     /// Whether worker is currently indexing.
@@ -191,6 +236,8 @@ struct State {
     last_error: Option<String>,
     /// Currently indexed logical IDs by file, used for incremental cleanup.
     indexed_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed relation IDs by file, used for incremental cleanup.
+    indexed_relation_ids_by_file: HashMap<String, HashSet<String>>,
 }
 
 impl State {
@@ -221,6 +268,8 @@ impl State {
 struct Services {
     /// Shared vector store client.
     store: QdrantVectorStore,
+    /// Dedicated vector store for relation documents.
+    relation_store: QdrantVectorStore,
 }
 
 /// Root application context injected into all tasks and handlers.
@@ -293,6 +342,7 @@ impl RaSessionManager {
         file_path_rel: &str,
         file_uri: &str,
         content: &str,
+        bulk_mode: bool,
     ) -> Result<Vec<RustItemDoc>> {
         let file_uri = if file_uri.is_empty() {
             path_to_file_uri(file_path_abs)?
@@ -311,7 +361,7 @@ impl RaSessionManager {
             )
             .await?;
         let mut docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
-        enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs).await?;
+        enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs, bulk_mode).await?;
         Ok(docs)
     }
 
@@ -322,6 +372,31 @@ impl RaSessionManager {
         if let Some(session) = self.session.as_mut() {
             let _ = session.close_document(file_uri).await;
         }
+    }
+
+    async fn extract_symbol_relations(
+        &mut self,
+        workspace_root: &Path,
+        workspace_id: &str,
+        file_path_rel: &str,
+        file_uri: &str,
+        content: &str,
+        docs: &[RustItemDoc],
+        bulk_mode: bool,
+    ) -> Result<Vec<SymbolRelationDoc>> {
+        let session = self.ensure_session(workspace_root).await?;
+        session.sync_document(file_uri, content).await?;
+        extract_symbol_relations_with_lsp(
+            session,
+            workspace_root,
+            workspace_id,
+            file_path_rel,
+            file_uri,
+            content,
+            docs,
+            bulk_mode,
+        )
+        .await
     }
 }
 
@@ -388,10 +463,48 @@ impl RaLspSession {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_retry(
+            method,
+            params,
+            LSP_REQUEST_TIMEOUT,
+            LSP_CONTENT_MODIFIED_RETRIES,
+        )
+        .await
+    }
+
+    async fn request_with_retry(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        retries: usize,
+    ) -> Result<Value> {
+        let mut attempts = 0usize;
+        loop {
+            let result = self
+                .request_with_timeout(method, params.clone(), timeout)
+                .await;
+            match result {
+                Ok(v) => return Ok(v),
+                Err(err) if attempts < retries && is_content_modified_error(&err) => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let req_id = self.next_id;
         self.next_id += 1;
 
-        tokio::time::timeout(LSP_REQUEST_TIMEOUT, async {
+        tokio::time::timeout(timeout, async {
             write_lsp_message(
                 &mut self.stdin,
                 &json!({
@@ -467,6 +580,11 @@ impl RaLspSession {
     }
 }
 
+fn is_content_modified_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("\"code\":-32801") || message.contains("content modified")
+}
+
 /// JSON-RPC request envelope.
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -503,6 +621,8 @@ struct InitializeParams {
     #[serde(rename = "qdrantUrl")]
     qdrant_url: Option<String>,
     collection: Option<String>,
+    #[serde(rename = "relationCollection")]
+    relation_collection: Option<String>,
     config: Option<InitializeConfig>,
 }
 
@@ -572,6 +692,15 @@ struct SearchFilters {
     workspace_id: Option<String>,
 }
 
+/// Optional filters accepted by `search_relations`.
+#[derive(Debug, Deserialize)]
+struct RelationSearchFilters {
+    workspace_id: Option<String>,
+    relation_kind: Option<String>,
+    source_file_path: Option<String>,
+    target_file_path: Option<String>,
+}
+
 /// `get_file_chunks` request body.
 #[derive(Debug, Deserialize)]
 struct GetFileChunksRequest {
@@ -583,6 +712,23 @@ struct GetFileChunksRequest {
 struct SymbolContextRequest {
     symbol: String,
     file_path: Option<String>,
+}
+
+/// `get_symbol_relations` request body.
+#[derive(Debug, Deserialize)]
+struct SymbolRelationsRequest {
+    symbol: String,
+    relation_kind: Option<String>,
+    file_path: Option<String>,
+}
+
+/// `search_relations` request body.
+#[derive(Debug, Deserialize)]
+struct SearchRelationsRequest {
+    query: String,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<RelationSearchFilters>,
 }
 
 /// `explain_relevance` request body.
@@ -651,6 +797,11 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
         .model(&config.embedding_model)
         .build()
         .context("failed to build Ollama embedding client")?;
+    let relation_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build relation embedding client")?;
 
     let store = if let Some(api_key) = &config.qdrant_api_key {
         QdrantVectorStore::with_api_key(
@@ -668,7 +819,26 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
     }
     .context("failed to initialize Qdrant store")?;
 
-    Ok(Services { store })
+    let relation_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            relation_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_relation_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            relation_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_relation_collection.clone(),
+        )
+    }
+    .context("failed to initialize relation Qdrant store")?;
+
+    Ok(Services {
+        store,
+        relation_store,
+    })
 }
 
 /// Background worker that debounces and batches indexing events.
@@ -775,6 +945,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
         .with_context(|| format!("failed reading file {}", path.display()))?;
 
     let cfg = app.config.read().await.clone();
+    let bulk_mode = app.state.read().await.queue_depth > BULK_SCAN_QUEUE_DEPTH_THRESHOLD;
     let workspace_id = cfg.workspace_id.clone();
     let file_uri = path_to_file_uri(path)?;
     let file_rel = path
@@ -783,14 +954,21 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
         .to_string_lossy()
         .to_string();
 
-    let previous_ids = app
-        .state
-        .read()
-        .await
-        .indexed_ids_by_file
-        .get(&file_rel)
-        .cloned()
-        .unwrap_or_default();
+    let (previous_ids, previous_relation_ids) = {
+        let state = app.state.read().await;
+        (
+            state
+                .indexed_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_relation_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    };
 
     let coarse_chunks = chunk_rust_file(&workspace_id, &file_rel, &file_uri, &content);
     if coarse_chunks.is_empty() {
@@ -802,37 +980,77 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
                 .await
                 .with_context(|| format!("qdrant delete failed for {}", file_rel))?;
         }
+        if !previous_relation_ids.is_empty() {
+            let stale_relation_ids = previous_relation_ids.into_iter().collect::<Vec<_>>();
+            services
+                .relation_store
+                .delete_documents_by_ids(&stale_relation_ids)
+                .await
+                .with_context(|| format!("qdrant relation delete failed for {}", file_rel))?;
+        }
         let mut state = app.state.write().await;
         state.rust_items_by_file.remove(&file_rel);
+        state.relations_by_file.remove(&file_rel);
         state.chunks_by_file.remove(&file_rel);
         state.indexed_ids_by_file.remove(&file_rel);
+        state.indexed_relation_ids_by_file.remove(&file_rel);
         return Ok(());
     }
 
     // Symbol-aware enrichment stage. When symbols are available, they replace
     // coarse chunk fallback docs for the same file.
-    let symbol_docs = match app
-        .ra_manager
-        .lock()
-        .await
-        .extract_symbol_docs(
-            &cfg.workspace_root,
-            &workspace_id,
-            path,
-            &file_rel,
-            &file_uri,
-            &content,
-        )
-        .await
-    {
-        Ok(docs) if !docs.is_empty() => docs,
-        Ok(_) => extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
-        Err(err) => {
-            eprintln!(
-                "rust-analyzer enrichment failed for {}: {err:#}. Falling back to heuristic extraction",
-                file_rel
-            );
-            extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content)
+    let (symbol_docs, relation_docs) = {
+        let mut ra = app.ra_manager.lock().await;
+        match ra
+            .extract_symbol_docs(
+                &cfg.workspace_root,
+                &workspace_id,
+                path,
+                &file_rel,
+                &file_uri,
+                &content,
+                bulk_mode,
+            )
+            .await
+        {
+            Ok(docs) if !docs.is_empty() => {
+                let relations = match ra
+                    .extract_symbol_relations(
+                        &cfg.workspace_root,
+                        &workspace_id,
+                        &file_rel,
+                        &file_uri,
+                        &content,
+                        &docs,
+                        bulk_mode,
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!(
+                            "rust-analyzer relation enrichment failed for {}: {err:#}",
+                            file_rel
+                        );
+                        Vec::new()
+                    }
+                };
+                (docs, relations)
+            }
+            Ok(_) => (
+                extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
+                Vec::new(),
+            ),
+            Err(err) => {
+                eprintln!(
+                    "rust-analyzer enrichment failed for {}: {err:#}. Falling back to heuristic extraction",
+                    file_rel
+                );
+                (
+                    extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
+                    Vec::new(),
+                )
+            }
         }
     };
 
@@ -857,6 +1075,22 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
         .await
         .with_context(|| format!("qdrant symbol upsert failed for {}", file_rel))?;
 
+    if !relation_docs.is_empty() {
+        let relation_rows = relation_docs
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: relation_named_vectors(doc),
+            })
+            .collect::<Vec<_>>();
+        services
+            .relation_store
+            .insert_documents_with_named_vectors(relation_rows)
+            .await
+            .with_context(|| format!("qdrant relation upsert failed for {}", file_rel))?;
+    }
+
     let final_chunks = symbol_docs_to_chunks(&final_docs);
     let final_ids = final_docs
         .iter()
@@ -874,13 +1108,36 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
             .await
             .with_context(|| format!("qdrant stale delete failed for {}", file_rel))?;
     }
+    let final_relation_ids = relation_docs
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    let stale_relation_ids = previous_relation_ids
+        .difference(&final_relation_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_relation_ids.is_empty() {
+        services
+            .relation_store
+            .delete_documents_by_ids(&stale_relation_ids)
+            .await
+            .with_context(|| format!("qdrant relation stale delete failed for {}", file_rel))?;
+    }
 
     let mut state = app.state.write().await;
     state
         .rust_items_by_file
         .insert(file_rel.clone(), final_docs);
+    state
+        .relations_by_file
+        .insert(file_rel.clone(), relation_docs.clone());
     state.chunks_by_file.insert(file_rel.clone(), final_chunks);
-    state.indexed_ids_by_file.insert(file_rel, final_ids);
+    state
+        .indexed_ids_by_file
+        .insert(file_rel.clone(), final_ids);
+    state
+        .indexed_relation_ids_by_file
+        .insert(file_rel, final_relation_ids);
 
     Ok(())
 }
@@ -902,25 +1159,40 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    let ids_to_delete = {
+    let (relation_ids_to_delete, symbol_ids_to_delete) = {
         let mut state = app.state.write().await;
         state.rust_items_by_file.remove(&file_rel);
+        state.relations_by_file.remove(&file_rel);
         state.chunks_by_file.remove(&file_rel);
-        state
+        let relation_ids_to_delete = state
+            .indexed_relation_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let symbol_ids_to_delete = state
             .indexed_ids_by_file
             .remove(&file_rel)
             .unwrap_or_default()
             .into_iter()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (relation_ids_to_delete, symbol_ids_to_delete)
     };
-
-    if !ids_to_delete.is_empty() {
+    if !symbol_ids_to_delete.is_empty() {
         let services = app.services.read().await.clone();
         services
             .store
-            .delete_documents_by_ids(&ids_to_delete)
+            .delete_documents_by_ids(&symbol_ids_to_delete)
             .await
             .with_context(|| format!("qdrant delete failed for {}", file_rel))?;
+    }
+    if !relation_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .relation_store
+            .delete_documents_by_ids(&relation_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant relation delete failed for {}", file_rel))?;
     }
 
     Ok(())
@@ -1196,35 +1468,362 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
     vectors
 }
 
+fn relation_search_text(doc: &SymbolRelationDoc) -> String {
+    format!(
+        "{relation_kind}\nsource_symbol: {source_symbol}\nsource_file: {source_file}\ntarget_file: {target_file}\nexcerpt:\n{excerpt}\nworkspace_id: {workspace_id}",
+        relation_kind = doc.relation_kind,
+        source_symbol = doc.source_symbol,
+        source_file = doc.source_file_path,
+        target_file = doc.target_file_path,
+        excerpt = doc.target_excerpt,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn relation_named_vectors(doc: &SymbolRelationDoc) -> HashMap<String, String> {
+    let mut vectors = HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{source_symbol}\nrelation: {relation_kind}\nsource_path: {source_file}\ntarget_path: {target_file}\nworkspace_id: {workspace_id}",
+                source_symbol = doc.source_symbol,
+                relation_kind = doc.relation_kind,
+                source_file = doc.source_file_path,
+                target_file = doc.target_file_path,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            DOCS_VECTOR_NAME.to_string(),
+            format!(
+                "relation: {relation_kind}\nsource_symbol: {source_symbol}\nsource: {source_file}\ntarget: {target_file}\nworkspace_id: {workspace_id}",
+                relation_kind = doc.relation_kind,
+                source_symbol = doc.source_symbol,
+                source_file = doc.source_file_path,
+                target_file = doc.target_file_path,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            SIGNATURE_VECTOR_NAME.to_string(),
+            format!(
+                "{relation_kind}\n{source_symbol}\n{source_file}:{line}\nworkspace_id: {workspace_id}",
+                relation_kind = doc.relation_kind,
+                source_symbol = doc.source_symbol,
+                source_file = doc.source_file_path,
+                line = doc.target_start_line,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+    ]);
+
+    if !doc.target_excerpt.trim().is_empty() {
+        vectors.insert(
+            BODY_VECTOR_NAME.to_string(),
+            format!(
+                "{excerpt}\nrelation: {relation_kind}\nsource_symbol: {source_symbol}\nsource: {source_file}\ntarget: {target_file}\nworkspace_id: {workspace_id}",
+                excerpt = doc.target_excerpt,
+                relation_kind = doc.relation_kind,
+                source_symbol = doc.source_symbol,
+                source_file = doc.source_file_path,
+                target_file = doc.target_file_path,
+                workspace_id = doc.workspace_id,
+            ),
+        );
+    }
+
+    vectors
+}
+
+async fn extract_symbol_relations_with_lsp(
+    session: &mut RaLspSession,
+    workspace_root: &Path,
+    workspace_id: &str,
+    file_path_rel: &str,
+    file_uri: &str,
+    content: &str,
+    docs: &[RustItemDoc],
+    bulk_mode: bool,
+) -> Result<Vec<SymbolRelationDoc>> {
+    let source_lines = content.lines().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cache = HashMap::<PathBuf, Vec<String>>::new();
+
+    for doc in docs {
+        let line = doc.start_line.saturating_sub(1);
+        let position = json!({ "line": line, "character": 0 });
+
+        let references = session
+            .request_with_retry(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": file_uri },
+                    "position": position,
+                    "context": { "includeDeclaration": false }
+                }),
+                LSP_HEAVY_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
+            )
+            .await;
+        if let Ok(references) = references {
+            append_relation_targets(
+                &mut out,
+                &mut seen,
+                &mut cache,
+                workspace_root,
+                workspace_id,
+                file_path_rel,
+                doc,
+                "references",
+                references,
+                &source_lines,
+            )
+            .await?;
+        }
+        if bulk_mode {
+            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        }
+
+        let implementations = session
+            .request_with_retry(
+                "textDocument/implementation",
+                json!({
+                    "textDocument": { "uri": file_uri },
+                    "position": position
+                }),
+                LSP_HEAVY_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
+            )
+            .await;
+        if let Ok(implementations) = implementations {
+            append_relation_targets(
+                &mut out,
+                &mut seen,
+                &mut cache,
+                workspace_root,
+                workspace_id,
+                file_path_rel,
+                doc,
+                "implementations",
+                implementations,
+                &source_lines,
+            )
+            .await?;
+        }
+        if bulk_mode {
+            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        }
+    }
+
+    Ok(out)
+}
+
+async fn append_relation_targets(
+    out: &mut Vec<SymbolRelationDoc>,
+    seen: &mut HashSet<String>,
+    cache: &mut HashMap<PathBuf, Vec<String>>,
+    workspace_root: &Path,
+    workspace_id: &str,
+    source_file_path: &str,
+    source_doc: &RustItemDoc,
+    relation_kind: &str,
+    payload: Value,
+    source_lines: &[&str],
+) -> Result<()> {
+    let locations = lsp_locations_from_value(&payload);
+    for loc in locations {
+        let Some(target_path) = uri_to_workspace_relative_path(workspace_root, &loc.uri) else {
+            continue;
+        };
+        let key = format!(
+            "{kind}:{source}:{target}:{start}:{end}",
+            kind = relation_kind,
+            source = source_doc.id,
+            target = target_path,
+            start = loc.start_line,
+            end = loc.end_line
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let excerpt = if target_path == source_file_path {
+            excerpt_from_range(
+                source_lines,
+                loc.start_line.saturating_sub(1),
+                loc.end_line.saturating_sub(1),
+                20,
+            )
+        } else {
+            excerpt_for_target(
+                cache,
+                workspace_root,
+                &target_path,
+                loc.start_line,
+                loc.end_line,
+            )
+            .await
+        };
+
+        let id = format!(
+            "relation:{workspace_id}:{kind}:{source}:{target}:{start}:{end}",
+            workspace_id = workspace_id,
+            kind = relation_kind,
+            source = source_doc.id,
+            target = target_path,
+            start = loc.start_line,
+            end = loc.end_line
+        );
+        out.push(SymbolRelationDoc {
+            id,
+            workspace_id: workspace_id.to_string(),
+            relation_kind: relation_kind.to_string(),
+            source_symbol_id: source_doc.id.clone(),
+            source_symbol: source_doc.symbol.clone(),
+            source_file_path: source_file_path.to_string(),
+            source_uri: source_doc.uri.clone(),
+            target_file_path: target_path,
+            target_uri: loc.uri,
+            target_start_line: loc.start_line,
+            target_end_line: loc.end_line,
+            target_excerpt: excerpt,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct LspLocation {
+    uri: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn lsp_locations_from_value(payload: &Value) -> Vec<LspLocation> {
+    if let Some(items) = payload.as_array() {
+        return items
+            .iter()
+            .filter_map(lsp_location_from_item)
+            .collect::<Vec<_>>();
+    }
+
+    payload
+        .get("uri")
+        .and_then(|_| lsp_location_from_item(payload))
+        .into_iter()
+        .collect::<Vec<_>>()
+}
+
+fn lsp_location_from_item(item: &Value) -> Option<LspLocation> {
+    let uri = item.get("uri")?.as_str()?.to_string();
+    let range = item.get("range")?.as_object()?;
+    let start = range.get("start")?.get("line")?.as_u64()? as usize + 1;
+    let end = range.get("end")?.get("line")?.as_u64()? as usize + 1;
+    Some(LspLocation {
+        uri,
+        start_line: start,
+        end_line: end.max(start),
+    })
+}
+
+fn uri_to_workspace_relative_path(workspace_root: &Path, uri: &str) -> Option<String> {
+    let path = file_uri_to_path(uri)?;
+    let rel = path.strip_prefix(workspace_root).ok()?;
+    Some(rel.to_string_lossy().to_string())
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    Some(PathBuf::from(percent_decode(raw)))
+}
+
+fn percent_decode(input: &str) -> String {
+    input
+        .replace("%20", " ")
+        .replace("%23", "#")
+        .replace("%3F", "?")
+        .replace("%25", "%")
+}
+
+async fn excerpt_for_target(
+    cache: &mut HashMap<PathBuf, Vec<String>>,
+    workspace_root: &Path,
+    target_file_path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> String {
+    let path = workspace_root.join(target_file_path);
+    if !cache.contains_key(&path) {
+        let lines = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content
+                .lines()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        cache.insert(path.clone(), lines);
+    }
+
+    let Some(lines) = cache.get(&path) else {
+        return String::new();
+    };
+    if lines.is_empty() {
+        return String::new();
+    }
+    let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+    excerpt_from_range(
+        &refs,
+        start_line.saturating_sub(1),
+        end_line.saturating_sub(1),
+        20,
+    )
+}
+
 async fn enrich_docs_with_lsp_metadata(
     session: &mut RaLspSession,
     file_uri: &str,
     docs: &mut [RustItemDoc],
+    bulk_mode: bool,
 ) -> Result<()> {
     for doc in docs {
         let line = doc.start_line.saturating_sub(1);
 
         let hover = session
-            .request(
+            .request_with_retry(
                 "textDocument/hover",
                 json!({
                     "textDocument": { "uri": file_uri },
                     "position": { "line": line, "character": 0 }
                 }),
+                LSP_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
             )
-            .await?;
-        doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
+            .await;
+        if let Ok(hover) = hover {
+            doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
+        }
+        if bulk_mode {
+            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        }
 
         let signature_help = session
-            .request(
+            .request_with_retry(
                 "textDocument/signatureHelp",
                 json!({
                     "textDocument": { "uri": file_uri },
                     "position": { "line": line, "character": 0 }
                 }),
+                LSP_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
             )
-            .await?;
-        doc.signature_help = lsp_signature_help_to_text(&signature_help).unwrap_or_default();
+            .await;
+        if let Ok(signature_help) = signature_help {
+            doc.signature_help = lsp_signature_help_to_text(&signature_help).unwrap_or_default();
+        }
+        if bulk_mode {
+            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        }
     }
 
     Ok(())

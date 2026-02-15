@@ -68,8 +68,10 @@ Example:
 - `GET /mcp/tools`
 - `GET /mcp/tools/index_status`
 - `POST /mcp/tools/search_code`
+- `POST /mcp/tools/search_relations`
 - `POST /mcp/tools/get_file_chunks`
 - `POST /mcp/tools/get_symbol_context`
+- `POST /mcp/tools/get_symbol_relations`
 - `POST /mcp/tools/explain_relevance`
 
 Example:
@@ -89,7 +91,8 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 - HTTP binds only to `127.0.0.1`.
 - rust-analyzer integration is session-based (persistent process per workspace) with `didOpen`/`didChange`/`didClose`.
 - Symbol extraction is enriched with LSP `documentSymbol`, `hover`, and `signatureHelp` data before vector upsert.
+- Cross-file relations are extracted via LSP `textDocument/references` and `textDocument/implementation` and persisted in a dedicated relation collection.
 
 ## Current limitation
 
-Advanced cross-file graph extraction (`references`, `implementations`, type graph edges) is not yet persisted as a dedicated relation index.
+Type-level graph edges (`typeDefinition`, call hierarchy, trait bounds graph) are not yet persisted as dedicated relation documents.

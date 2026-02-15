@@ -128,6 +128,9 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         if let Some(collection) = params.collection {
             cfg.qdrant_collection = collection;
         }
+        if let Some(relation_collection) = params.relation_collection {
+            cfg.qdrant_relation_collection = relation_collection;
+        }
         if let Some(config) = params.config {
             if let Some(v) = config.ollama_base_url {
                 cfg.ollama_base_url = v;
@@ -159,8 +162,10 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
     if workspace_changed {
         let mut state = app.state.write().await;
         state.rust_items_by_file.clear();
+        state.relations_by_file.clear();
         state.chunks_by_file.clear();
         state.indexed_ids_by_file.clear();
+        state.indexed_relation_ids_by_file.clear();
         state.queue_depth = 0;
         state.indexing_in_progress = false;
         state.last_error = None;
