@@ -7330,6 +7330,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-copilot-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autoagents-core",
+ "autoagents-llm",
+ "autoagents-qdrant",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "walkdir",
+]
+
+[[package]]
 name = "rust-mcp-schema"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -166,11 +166,19 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         state.chunks_by_file.clear();
         state.indexed_ids_by_file.clear();
         state.indexed_relation_ids_by_file.clear();
+        state.workspace_metadata = None;
+        state.metadata_docs_by_crate.clear();
+        state.indexed_metadata_ids.clear();
+        state.extraction_metrics = ExtractionMetrics::default();
         state.queue_depth = 0;
         state.indexing_in_progress = false;
         state.last_error = None;
         drop(state);
         app.ra_manager.lock().await.reset().await;
+    }
+
+    if let Err(err) = refresh_workspace_metadata(&app).await {
+        eprintln!("workspace metadata refresh failed: {err:#}");
     }
 
     Ok(json!({
@@ -255,6 +263,9 @@ async fn handle_workspace_renamed(
         cfg.workspace_id = derive_workspace_id(&cfg.workspace_root);
         drop(cfg);
         app.ra_manager.lock().await.reset().await;
+        if let Err(err) = refresh_workspace_metadata(&app).await {
+            eprintln!("workspace metadata refresh failed after rename: {err:#}");
+        }
         return Ok(json!({"ok": true}));
     }
 

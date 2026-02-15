@@ -13,3 +13,4 @@ walkdir = { workspace = true }
 autoagents-core = { workspace = true }
 autoagents-llm = { workspace = true, features = ["ollama"] }
 autoagents-qdrant = { workspace = true }
+toml = "0.8"

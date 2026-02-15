@@ -36,7 +36,6 @@ const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const LSP_HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const LSP_CONTENT_MODIFIED_RETRIES: usize = 2;
 const BULK_SCAN_QUEUE_DEPTH_THRESHOLD: usize = 32;
-const BULK_SCAN_REQUEST_PAUSE_MS: u64 = 2;
 
 /// Runtime configuration shared across JSON-RPC and MCP layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +134,12 @@ struct RustItemDoc {
     uri: String,
     /// Best-effort module path from file path.
     module: String,
+    /// Best-effort fully-qualified symbol path.
+    symbol_path: String,
+    /// Owning crate name inferred from workspace Cargo metadata.
+    crate_name: String,
+    /// Rust edition from crate metadata.
+    edition: String,
     /// Signature/header line.
     signature: String,
     /// Joined doc comments directly above the item.
@@ -174,6 +179,8 @@ struct SymbolRelationDoc {
     source_symbol: String,
     /// Source file path.
     source_file_path: String,
+    /// Source crate name.
+    source_crate_name: String,
     /// Source uri.
     source_uri: String,
     /// Target file path.
@@ -215,6 +222,110 @@ struct StatusSnapshot {
     indexed_at_unix_ms: Option<u128>,
     /// Last indexing error, if any.
     last_error: Option<String>,
+    /// Extraction metrics for quality/observability.
+    extraction_metrics: ExtractionMetrics,
+    /// Count of indexed workspace crates.
+    workspace_crates: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkspaceMetadata {
+    workspace_root: String,
+    crates: Vec<CrateMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CrateMetadata {
+    crate_name: String,
+    edition: String,
+    crate_root: String,
+    manifest_path: String,
+    features: Vec<String>,
+    optional_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrateMetadataDoc {
+    id: String,
+    workspace_id: String,
+    crate_name: String,
+    edition: String,
+    crate_root: String,
+    manifest_path: String,
+    features: Vec<String>,
+    optional_dependencies: Vec<String>,
+}
+
+impl Embed for CrateMetadataDoc {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
+        embedder.embed(crate_metadata_search_text(self));
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct ExtractionMetrics {
+    files_reindexed_total: u64,
+    files_fallback_heuristic_total: u64,
+    symbols_indexed_total: u64,
+    relations_indexed_total: u64,
+    hover_success_total: u64,
+    hover_failed_total: u64,
+    workspace_symbol_success_total: u64,
+    workspace_symbol_failed_total: u64,
+    workspace_symbol_nonempty_total: u64,
+    signature_help_success_total: u64,
+    signature_help_failed_total: u64,
+    references_success_total: u64,
+    references_failed_total: u64,
+    references_nonempty_total: u64,
+    implementations_success_total: u64,
+    implementations_failed_total: u64,
+    implementations_nonempty_total: u64,
+    definitions_success_total: u64,
+    definitions_failed_total: u64,
+    definitions_nonempty_total: u64,
+    type_definitions_success_total: u64,
+    type_definitions_failed_total: u64,
+    type_definitions_nonempty_total: u64,
+    relations_references_emitted_total: u64,
+    relations_implementations_emitted_total: u64,
+    relations_definitions_emitted_total: u64,
+    relations_type_definitions_emitted_total: u64,
+    content_modified_retries_total: u64,
+    request_timeouts_total: u64,
+}
+
+#[derive(Debug, Default)]
+struct FileExtractionMetrics {
+    fallback_heuristic: bool,
+    symbols_indexed: usize,
+    relations_indexed: usize,
+    hover_success: u64,
+    hover_failed: u64,
+    workspace_symbol_success: u64,
+    workspace_symbol_failed: u64,
+    workspace_symbol_nonempty: u64,
+    signature_help_success: u64,
+    signature_help_failed: u64,
+    references_success: u64,
+    references_failed: u64,
+    references_nonempty: u64,
+    relations_references_emitted: u64,
+    implementations_success: u64,
+    implementations_failed: u64,
+    implementations_nonempty: u64,
+    relations_implementations_emitted: u64,
+    definitions_success: u64,
+    definitions_failed: u64,
+    definitions_nonempty: u64,
+    relations_definitions_emitted: u64,
+    type_definitions_success: u64,
+    type_definitions_failed: u64,
+    type_definitions_nonempty: u64,
+    relations_type_definitions_emitted: u64,
+    content_modified_retries: u64,
+    request_timeouts: u64,
 }
 
 /// Mutable daemon state shared by both planes.
@@ -238,6 +349,14 @@ struct State {
     indexed_ids_by_file: HashMap<String, HashSet<String>>,
     /// Currently indexed relation IDs by file, used for incremental cleanup.
     indexed_relation_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Parsed workspace metadata snapshot.
+    workspace_metadata: Option<WorkspaceMetadata>,
+    /// Indexed metadata docs by crate root.
+    metadata_docs_by_crate: HashMap<String, CrateMetadataDoc>,
+    /// Logical IDs for metadata docs in vector store.
+    indexed_metadata_ids: HashSet<String>,
+    /// Aggregated extraction metrics.
+    extraction_metrics: ExtractionMetrics,
 }
 
 impl State {
@@ -259,6 +378,12 @@ impl State {
             total_chunks,
             indexed_at_unix_ms: self.indexed_at_unix_ms,
             last_error: self.last_error.clone(),
+            extraction_metrics: self.extraction_metrics.clone(),
+            workspace_crates: self
+                .workspace_metadata
+                .as_ref()
+                .map(|w| w.crates.len())
+                .unwrap_or(0),
         }
     }
 }
@@ -343,6 +468,7 @@ impl RaSessionManager {
         file_uri: &str,
         content: &str,
         bulk_mode: bool,
+        metrics: &mut FileExtractionMetrics,
     ) -> Result<Vec<RustItemDoc>> {
         let file_uri = if file_uri.is_empty() {
             path_to_file_uri(file_path_abs)?
@@ -361,7 +487,7 @@ impl RaSessionManager {
             )
             .await?;
         let mut docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
-        enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs, bulk_mode).await?;
+        enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs, bulk_mode, metrics).await?;
         Ok(docs)
     }
 
@@ -383,6 +509,7 @@ impl RaSessionManager {
         content: &str,
         docs: &[RustItemDoc],
         bulk_mode: bool,
+        metrics: &mut FileExtractionMetrics,
     ) -> Result<Vec<SymbolRelationDoc>> {
         let session = self.ensure_session(workspace_root).await?;
         session.sync_document(file_uri, content).await?;
@@ -395,8 +522,16 @@ impl RaSessionManager {
             content,
             docs,
             bulk_mode,
+            metrics,
         )
         .await
+    }
+
+    fn session_counters(&self) -> RaSessionCounters {
+        self.session
+            .as_ref()
+            .map(RaLspSession::counters)
+            .unwrap_or_default()
     }
 }
 
@@ -406,6 +541,14 @@ struct RaLspSession {
     reader: BufReader<ChildStdout>,
     next_id: i64,
     open_doc_versions: HashMap<String, i64>,
+    content_modified_retries_total: u64,
+    request_timeouts_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RaSessionCounters {
+    content_modified_retries_total: u64,
+    request_timeouts_total: u64,
 }
 
 impl RaLspSession {
@@ -431,6 +574,8 @@ impl RaLspSession {
             reader: BufReader::new(stdout),
             next_id: 1,
             open_doc_versions: HashMap::new(),
+            content_modified_retries_total: 0,
+            request_timeouts_total: 0,
         };
 
         let workspace_uri = path_to_file_uri(workspace_root)?;
@@ -488,6 +633,7 @@ impl RaLspSession {
                 Ok(v) => return Ok(v),
                 Err(err) if attempts < retries && is_content_modified_error(&err) => {
                     attempts += 1;
+                    self.content_modified_retries_total += 1;
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(err) => return Err(err),
@@ -520,7 +666,10 @@ impl RaLspSession {
             Ok::<Value, anyhow::Error>(response.get("result").cloned().unwrap_or(Value::Null))
         })
         .await
-        .map_err(|_| anyhow::anyhow!("rust-analyzer request timed out: {method}"))?
+        .map_err(|_| {
+            self.request_timeouts_total += 1;
+            anyhow::anyhow!("rust-analyzer request timed out: {method}")
+        })?
     }
 
     async fn sync_document(&mut self, file_uri: &str, content: &str) -> Result<()> {
@@ -577,6 +726,13 @@ impl RaLspSession {
         let _ = self.notify("exit", Value::Null).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         Ok(())
+    }
+
+    fn counters(&self) -> RaSessionCounters {
+        RaSessionCounters {
+            content_modified_retries_total: self.content_modified_retries_total,
+            request_timeouts_total: self.request_timeouts_total,
+        }
     }
 }
 
@@ -905,17 +1061,19 @@ fn insert_batch_event(batch: &mut HashMap<PathBuf, DirtyEvent>, event: DirtyEven
 
 /// Processes one debounced batch and updates status state.
 async fn process_batch(app: App, events: Vec<DirtyEvent>) {
-    {
+    let batch_bulk_mode = {
         let mut state = app.state.write().await;
+        let queued_before = state.queue_depth;
         state.indexing_in_progress = true;
         state.queue_depth = state.queue_depth.saturating_sub(events.len());
-    }
+        queued_before > BULK_SCAN_QUEUE_DEPTH_THRESHOLD || events.len() > 1
+    };
 
     let services = app.services.read().await.clone();
 
     for event in events {
         let result = match event {
-            DirtyEvent::Index(path) => reindex_file(&app, &services, &path).await,
+            DirtyEvent::Index(path) => reindex_file(&app, &services, &path, batch_bulk_mode).await,
             DirtyEvent::Delete(path) => delete_file_chunks(&app, &path).await,
         };
 
@@ -931,7 +1089,12 @@ async fn process_batch(app: App, events: Vec<DirtyEvent>) {
 }
 
 /// Reads and re-indexes one Rust file into Qdrant and local cache.
-async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()> {
+async fn reindex_file(
+    app: &App,
+    services: &Services,
+    path: &Path,
+    bulk_mode: bool,
+) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
@@ -945,7 +1108,6 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
         .with_context(|| format!("failed reading file {}", path.display()))?;
 
     let cfg = app.config.read().await.clone();
-    let bulk_mode = app.state.read().await.queue_depth > BULK_SCAN_QUEUE_DEPTH_THRESHOLD;
     let workspace_id = cfg.workspace_id.clone();
     let file_uri = path_to_file_uri(path)?;
     let file_rel = path
@@ -999,8 +1161,10 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
 
     // Symbol-aware enrichment stage. When symbols are available, they replace
     // coarse chunk fallback docs for the same file.
-    let (symbol_docs, relation_docs) = {
+    let mut file_metrics = FileExtractionMetrics::default();
+    let (symbol_docs, mut relation_docs) = {
         let mut ra = app.ra_manager.lock().await;
+        let counters_before = ra.session_counters();
         match ra
             .extract_symbol_docs(
                 &cfg.workspace_root,
@@ -1010,6 +1174,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
                 &file_uri,
                 &content,
                 bulk_mode,
+                &mut file_metrics,
             )
             .await
         {
@@ -1023,6 +1188,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
                         &content,
                         &docs,
                         bulk_mode,
+                        &mut file_metrics,
                     )
                     .await
                 {
@@ -1035,17 +1201,42 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
                         Vec::new()
                     }
                 };
+                let counters_after = ra.session_counters();
+                file_metrics.content_modified_retries = counters_after
+                    .content_modified_retries_total
+                    .saturating_sub(counters_before.content_modified_retries_total);
+                file_metrics.request_timeouts = counters_after
+                    .request_timeouts_total
+                    .saturating_sub(counters_before.request_timeouts_total);
                 (docs, relations)
             }
-            Ok(_) => (
-                extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
-                Vec::new(),
-            ),
+            Ok(_) => {
+                file_metrics.fallback_heuristic = true;
+                let counters_after = ra.session_counters();
+                file_metrics.content_modified_retries = counters_after
+                    .content_modified_retries_total
+                    .saturating_sub(counters_before.content_modified_retries_total);
+                file_metrics.request_timeouts = counters_after
+                    .request_timeouts_total
+                    .saturating_sub(counters_before.request_timeouts_total);
+                (
+                    extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
+                    Vec::new(),
+                )
+            }
             Err(err) => {
                 eprintln!(
                     "rust-analyzer enrichment failed for {}: {err:#}. Falling back to heuristic extraction",
                     file_rel
                 );
+                file_metrics.fallback_heuristic = true;
+                let counters_after = ra.session_counters();
+                file_metrics.content_modified_retries = counters_after
+                    .content_modified_retries_total
+                    .saturating_sub(counters_before.content_modified_retries_total);
+                file_metrics.request_timeouts = counters_after
+                    .request_timeouts_total
+                    .saturating_sub(counters_before.request_timeouts_total);
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
                     Vec::new(),
@@ -1054,11 +1245,16 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
         }
     };
 
-    let final_docs = if symbol_docs.is_empty() {
+    let mut final_docs = if symbol_docs.is_empty() {
         coarse_chunks_to_symbol_docs(&coarse_chunks)
     } else {
         symbol_docs
     };
+    let metadata_docs_by_crate = app.state.read().await.metadata_docs_by_crate.clone();
+    if let Some(crate_meta) = find_crate_metadata_for_file(&metadata_docs_by_crate, &file_rel) {
+        apply_crate_metadata_to_symbol_docs(&mut final_docs, crate_meta);
+        apply_crate_metadata_to_relation_docs(&mut relation_docs, crate_meta);
+    }
 
     let symbol_rows = final_docs
         .iter()
@@ -1124,6 +1320,8 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
             .with_context(|| format!("qdrant relation stale delete failed for {}", file_rel))?;
     }
 
+    file_metrics.symbols_indexed = final_docs.len();
+    file_metrics.relations_indexed = relation_docs.len();
     let mut state = app.state.write().await;
     state
         .rust_items_by_file
@@ -1138,6 +1336,40 @@ async fn reindex_file(app: &App, services: &Services, path: &Path) -> Result<()>
     state
         .indexed_relation_ids_by_file
         .insert(file_rel, final_relation_ids);
+    let metrics = &mut state.extraction_metrics;
+    metrics.files_reindexed_total += 1;
+    if file_metrics.fallback_heuristic {
+        metrics.files_fallback_heuristic_total += 1;
+    }
+    metrics.symbols_indexed_total += file_metrics.symbols_indexed as u64;
+    metrics.relations_indexed_total += file_metrics.relations_indexed as u64;
+    metrics.hover_success_total += file_metrics.hover_success;
+    metrics.hover_failed_total += file_metrics.hover_failed;
+    metrics.workspace_symbol_success_total += file_metrics.workspace_symbol_success;
+    metrics.workspace_symbol_failed_total += file_metrics.workspace_symbol_failed;
+    metrics.workspace_symbol_nonempty_total += file_metrics.workspace_symbol_nonempty;
+    metrics.signature_help_success_total += file_metrics.signature_help_success;
+    metrics.signature_help_failed_total += file_metrics.signature_help_failed;
+    metrics.references_success_total += file_metrics.references_success;
+    metrics.references_failed_total += file_metrics.references_failed;
+    metrics.references_nonempty_total += file_metrics.references_nonempty;
+    metrics.implementations_success_total += file_metrics.implementations_success;
+    metrics.implementations_failed_total += file_metrics.implementations_failed;
+    metrics.implementations_nonempty_total += file_metrics.implementations_nonempty;
+    metrics.definitions_success_total += file_metrics.definitions_success;
+    metrics.definitions_failed_total += file_metrics.definitions_failed;
+    metrics.definitions_nonempty_total += file_metrics.definitions_nonempty;
+    metrics.type_definitions_success_total += file_metrics.type_definitions_success;
+    metrics.type_definitions_failed_total += file_metrics.type_definitions_failed;
+    metrics.type_definitions_nonempty_total += file_metrics.type_definitions_nonempty;
+    metrics.relations_references_emitted_total += file_metrics.relations_references_emitted;
+    metrics.relations_implementations_emitted_total +=
+        file_metrics.relations_implementations_emitted;
+    metrics.relations_definitions_emitted_total += file_metrics.relations_definitions_emitted;
+    metrics.relations_type_definitions_emitted_total +=
+        file_metrics.relations_type_definitions_emitted;
+    metrics.content_modified_retries_total += file_metrics.content_modified_retries;
+    metrics.request_timeouts_total += file_metrics.request_timeouts;
 
     Ok(())
 }
@@ -1209,6 +1441,9 @@ fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<RustItemDoc> {
             workspace_id: chunk.workspace_id.clone(),
             uri: chunk.uri.clone(),
             module: module_from_file_path(&chunk.file_path),
+            symbol_path: String::new(),
+            crate_name: String::new(),
+            edition: String::new(),
             signature: chunk
                 .text
                 .lines()
@@ -1394,14 +1629,17 @@ fn derive_workspace_id(workspace_root: &Path) -> String {
 
 fn rust_item_search_text(doc: &RustItemDoc) -> String {
     format!(
-        "{symbol}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
         symbol = doc.symbol,
+        symbol_path = doc.symbol_path,
         signature = doc.signature,
         signature_help = doc.signature_help,
         docs = doc.docs,
         hover_summary = doc.hover_summary,
         body_excerpt = doc.body_excerpt,
         module = doc.module,
+        crate_name = doc.crate_name,
+        edition = doc.edition,
         file_path = doc.file_path,
         kind = doc.kind,
         uri = doc.uri,
@@ -1410,7 +1648,7 @@ fn rust_item_search_text(doc: &RustItemDoc) -> String {
 }
 
 fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
-    let mut vectors = HashMap::from([
+    HashMap::from([
         (
             SYMBOL_VECTOR_NAME.to_string(),
             format!(
@@ -1447,32 +1685,15 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
                 workspace_id = doc.workspace_id,
             ),
         ),
-    ]);
-
-    if !doc.body_excerpt.trim().is_empty() {
-        vectors.insert(
-            BODY_VECTOR_NAME.to_string(),
-            format!(
-                "{body_excerpt}\nhover: {hover}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
-                body_excerpt = doc.body_excerpt,
-                hover = doc.hover_summary,
-                symbol = doc.symbol,
-                kind = doc.kind,
-                module = doc.module,
-                file_path = doc.file_path,
-                workspace_id = doc.workspace_id,
-            ),
-        );
-    }
-
-    vectors
+    ])
 }
 
 fn relation_search_text(doc: &SymbolRelationDoc) -> String {
     format!(
-        "{relation_kind}\nsource_symbol: {source_symbol}\nsource_file: {source_file}\ntarget_file: {target_file}\nexcerpt:\n{excerpt}\nworkspace_id: {workspace_id}",
+        "{relation_kind}\nsource_symbol: {source_symbol}\nsource_crate: {source_crate}\nsource_file: {source_file}\ntarget_file: {target_file}\nexcerpt:\n{excerpt}\nworkspace_id: {workspace_id}",
         relation_kind = doc.relation_kind,
         source_symbol = doc.source_symbol,
+        source_crate = doc.source_crate_name,
         source_file = doc.source_file_path,
         target_file = doc.target_file_path,
         excerpt = doc.target_excerpt,
@@ -1535,6 +1756,211 @@ fn relation_named_vectors(doc: &SymbolRelationDoc) -> HashMap<String, String> {
     vectors
 }
 
+fn crate_metadata_search_text(doc: &CrateMetadataDoc) -> String {
+    format!(
+        "crate: {crate_name}\nedition: {edition}\nroot: {crate_root}\nmanifest: {manifest}\nfeatures: {features}\noptional_dependencies: {optional}\nworkspace_id: {workspace_id}",
+        crate_name = doc.crate_name,
+        edition = doc.edition,
+        crate_root = doc.crate_root,
+        manifest = doc.manifest_path,
+        features = doc.features.join(","),
+        optional = doc.optional_dependencies.join(","),
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn crate_metadata_named_vectors(doc: &CrateMetadataDoc) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{crate_name}\ncrate_root: {crate_root}\nworkspace_id: {workspace_id}",
+                crate_name = doc.crate_name,
+                crate_root = doc.crate_root,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            DOCS_VECTOR_NAME.to_string(),
+            format!(
+                "features: {features}\noptional_dependencies: {optional}\ncrate: {crate_name}\nworkspace_id: {workspace_id}",
+                features = doc.features.join(","),
+                optional = doc.optional_dependencies.join(","),
+                crate_name = doc.crate_name,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            SIGNATURE_VECTOR_NAME.to_string(),
+            format!(
+                "edition: {edition}\nmanifest: {manifest}\ncrate: {crate_name}\nworkspace_id: {workspace_id}",
+                edition = doc.edition,
+                manifest = doc.manifest_path,
+                crate_name = doc.crate_name,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+    ])
+}
+
+fn build_crate_metadata_docs(
+    workspace_id: &str,
+    metadata: &WorkspaceMetadata,
+) -> Vec<CrateMetadataDoc> {
+    metadata
+        .crates
+        .iter()
+        .map(|c| CrateMetadataDoc {
+            id: format!("metadata:{workspace_id}:{}", c.crate_root),
+            workspace_id: workspace_id.to_string(),
+            crate_name: c.crate_name.clone(),
+            edition: c.edition.clone(),
+            crate_root: c.crate_root.clone(),
+            manifest_path: c.manifest_path.clone(),
+            features: c.features.clone(),
+            optional_dependencies: c.optional_dependencies.clone(),
+        })
+        .collect()
+}
+
+async fn refresh_workspace_metadata(app: &App) -> Result<()> {
+    let cfg = app.config.read().await.clone();
+    let metadata = load_workspace_metadata(&cfg.workspace_root)?;
+    let docs = build_crate_metadata_docs(&cfg.workspace_id, &metadata);
+    let new_ids = docs.iter().map(|d| d.id.clone()).collect::<HashSet<_>>();
+
+    let previous_ids = app.state.read().await.indexed_metadata_ids.clone();
+    let stale_ids = previous_ids
+        .difference(&new_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_ids.is_empty() {
+        app.services
+            .read()
+            .await
+            .store
+            .delete_documents_by_ids(&stale_ids)
+            .await
+            .context("qdrant metadata stale delete failed")?;
+    }
+
+    if !docs.is_empty() {
+        let rows = docs
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: crate_metadata_named_vectors(doc),
+            })
+            .collect::<Vec<_>>();
+        app.services
+            .read()
+            .await
+            .store
+            .insert_documents_with_named_vectors(rows)
+            .await
+            .context("qdrant metadata upsert failed")?;
+    }
+
+    let mut by_crate = HashMap::new();
+    for doc in docs {
+        by_crate.insert(doc.crate_root.clone(), doc);
+    }
+
+    let mut state = app.state.write().await;
+    state.workspace_metadata = Some(metadata);
+    state.metadata_docs_by_crate = by_crate;
+    state.indexed_metadata_ids = new_ids;
+    Ok(())
+}
+
+fn load_workspace_metadata(root: &Path) -> Result<WorkspaceMetadata> {
+    let mut crates = Vec::<CrateMetadata>::new();
+    for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        name != ".git" && name != "target"
+    }) {
+        let entry = entry?;
+        if !entry.file_type().is_file() || entry.file_name() != "Cargo.toml" {
+            continue;
+        }
+
+        let manifest_path = entry.path().to_path_buf();
+        let content = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+        let value: toml::Value = content
+            .parse::<toml::Value>()
+            .with_context(|| format!("invalid Cargo.toml: {}", manifest_path.display()))?;
+        let Some(pkg) = value.get("package").and_then(|v| v.as_table()) else {
+            continue;
+        };
+        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let edition = pkg
+            .get("edition")
+            .and_then(|v| v.as_str())
+            .unwrap_or("2021")
+            .to_string();
+        let crate_root = manifest_path
+            .parent()
+            .unwrap_or(root)
+            .strip_prefix(root)
+            .unwrap_or_else(|_| Path::new(""))
+            .to_string_lossy()
+            .to_string();
+        let manifest_rel = manifest_path
+            .strip_prefix(root)
+            .unwrap_or(manifest_path.as_path())
+            .to_string_lossy()
+            .to_string();
+
+        let features = value
+            .get("features")
+            .and_then(|v| v.as_table())
+            .map(|t| t.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let optional_dependencies = collect_optional_dependencies(&value);
+
+        crates.push(CrateMetadata {
+            crate_name: name.to_string(),
+            edition,
+            crate_root,
+            manifest_path: manifest_rel,
+            features,
+            optional_dependencies,
+        });
+    }
+
+    crates.sort_by(|a, b| a.crate_root.cmp(&b.crate_root));
+    Ok(WorkspaceMetadata {
+        workspace_root: root.to_string_lossy().to_string(),
+        crates,
+    })
+}
+
+fn collect_optional_dependencies(value: &toml::Value) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(table) = value.get(key).and_then(|v| v.as_table()) else {
+            continue;
+        };
+        for (dep, cfg) in table {
+            if cfg
+                .as_table()
+                .and_then(|t| t.get("optional"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                out.push(dep.clone());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn extract_symbol_relations_with_lsp(
     session: &mut RaLspSession,
     workspace_root: &Path,
@@ -1544,6 +1970,7 @@ async fn extract_symbol_relations_with_lsp(
     content: &str,
     docs: &[RustItemDoc],
     bulk_mode: bool,
+    metrics: &mut FileExtractionMetrics,
 ) -> Result<Vec<SymbolRelationDoc>> {
     let source_lines = content.lines().collect::<Vec<_>>();
     let mut out = Vec::new();
@@ -1551,6 +1978,9 @@ async fn extract_symbol_relations_with_lsp(
     let mut cache = HashMap::<PathBuf, Vec<String>>::new();
 
     for doc in docs {
+        if !should_extract_relations_for_symbol(doc, bulk_mode) {
+            continue;
+        }
         let line = doc.start_line.saturating_sub(1);
         let position = json!({ "line": line, "character": 0 });
 
@@ -1567,7 +1997,8 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await;
         if let Ok(references) = references {
-            append_relation_targets(
+            metrics.references_success += 1;
+            let emitted = append_relation_targets(
                 &mut out,
                 &mut seen,
                 &mut cache,
@@ -1580,11 +2011,13 @@ async fn extract_symbol_relations_with_lsp(
                 &source_lines,
             )
             .await?;
+            if emitted > 0 {
+                metrics.references_nonempty += 1;
+            }
+            metrics.relations_references_emitted += emitted as u64;
+        } else {
+            metrics.references_failed += 1;
         }
-        if bulk_mode {
-            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
-        }
-
         let implementations = session
             .request_with_retry(
                 "textDocument/implementation",
@@ -1597,7 +2030,8 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await;
         if let Ok(implementations) = implementations {
-            append_relation_targets(
+            metrics.implementations_success += 1;
+            let emitted = append_relation_targets(
                 &mut out,
                 &mut seen,
                 &mut cache,
@@ -1610,9 +2044,78 @@ async fn extract_symbol_relations_with_lsp(
                 &source_lines,
             )
             .await?;
+            if emitted > 0 {
+                metrics.implementations_nonempty += 1;
+            }
+            metrics.relations_implementations_emitted += emitted as u64;
+        } else {
+            metrics.implementations_failed += 1;
         }
-        if bulk_mode {
-            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        let definitions = session
+            .request_with_retry(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": file_uri },
+                    "position": position
+                }),
+                LSP_HEAVY_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
+            )
+            .await;
+        if let Ok(definitions) = definitions {
+            metrics.definitions_success += 1;
+            let emitted = append_relation_targets(
+                &mut out,
+                &mut seen,
+                &mut cache,
+                workspace_root,
+                workspace_id,
+                file_path_rel,
+                doc,
+                "definitions",
+                definitions,
+                &source_lines,
+            )
+            .await?;
+            if emitted > 0 {
+                metrics.definitions_nonempty += 1;
+            }
+            metrics.relations_definitions_emitted += emitted as u64;
+        } else {
+            metrics.definitions_failed += 1;
+        }
+        let type_definitions = session
+            .request_with_retry(
+                "textDocument/typeDefinition",
+                json!({
+                    "textDocument": { "uri": file_uri },
+                    "position": position
+                }),
+                LSP_HEAVY_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
+            )
+            .await;
+        if let Ok(type_definitions) = type_definitions {
+            metrics.type_definitions_success += 1;
+            let emitted = append_relation_targets(
+                &mut out,
+                &mut seen,
+                &mut cache,
+                workspace_root,
+                workspace_id,
+                file_path_rel,
+                doc,
+                "type_definitions",
+                type_definitions,
+                &source_lines,
+            )
+            .await?;
+            if emitted > 0 {
+                metrics.type_definitions_nonempty += 1;
+            }
+            metrics.relations_type_definitions_emitted += emitted as u64;
+        } else {
+            metrics.type_definitions_failed += 1;
         }
     }
 
@@ -1630,8 +2133,9 @@ async fn append_relation_targets(
     relation_kind: &str,
     payload: Value,
     source_lines: &[&str],
-) -> Result<()> {
+) -> Result<usize> {
     let locations = lsp_locations_from_value(&payload);
+    let mut emitted = 0usize;
     for loc in locations {
         let Some(target_path) = uri_to_workspace_relative_path(workspace_root, &loc.uri) else {
             continue;
@@ -1682,6 +2186,7 @@ async fn append_relation_targets(
             source_symbol_id: source_doc.id.clone(),
             source_symbol: source_doc.symbol.clone(),
             source_file_path: source_file_path.to_string(),
+            source_crate_name: source_doc.crate_name.clone(),
             source_uri: source_doc.uri.clone(),
             target_file_path: target_path,
             target_uri: loc.uri,
@@ -1689,8 +2194,9 @@ async fn append_relation_targets(
             target_end_line: loc.end_line,
             target_excerpt: excerpt,
         });
+        emitted += 1;
     }
-    Ok(())
+    Ok(emitted)
 }
 
 #[derive(Debug)]
@@ -1785,6 +2291,7 @@ async fn enrich_docs_with_lsp_metadata(
     file_uri: &str,
     docs: &mut [RustItemDoc],
     bulk_mode: bool,
+    metrics: &mut FileExtractionMetrics,
 ) -> Result<()> {
     for doc in docs {
         let line = doc.start_line.saturating_sub(1);
@@ -1801,32 +2308,70 @@ async fn enrich_docs_with_lsp_metadata(
             )
             .await;
         if let Ok(hover) = hover {
+            metrics.hover_success += 1;
             doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
+        } else {
+            metrics.hover_failed += 1;
         }
-        if bulk_mode {
-            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        if doc.kind == "fn" {
+            let signature_help = session
+                .request_with_retry(
+                    "textDocument/signatureHelp",
+                    json!({
+                        "textDocument": { "uri": file_uri },
+                        "position": { "line": line, "character": 0 }
+                    }),
+                    LSP_REQUEST_TIMEOUT,
+                    LSP_CONTENT_MODIFIED_RETRIES,
+                )
+                .await;
+            if let Ok(signature_help) = signature_help {
+                metrics.signature_help_success += 1;
+                doc.signature_help = lsp_signature_help_to_text(&signature_help).unwrap_or_default();
+            } else {
+                metrics.signature_help_failed += 1;
+            }
         }
 
-        let signature_help = session
-            .request_with_retry(
-                "textDocument/signatureHelp",
-                json!({
-                    "textDocument": { "uri": file_uri },
-                    "position": { "line": line, "character": 0 }
-                }),
-                LSP_REQUEST_TIMEOUT,
-                LSP_CONTENT_MODIFIED_RETRIES,
-            )
-            .await;
-        if let Ok(signature_help) = signature_help {
-            doc.signature_help = lsp_signature_help_to_text(&signature_help).unwrap_or_default();
-        }
-        if bulk_mode {
-            tokio::time::sleep(Duration::from_millis(BULK_SCAN_REQUEST_PAUSE_MS)).await;
+        if !bulk_mode {
+            let ws_symbol = session
+                .request_with_retry(
+                    "workspace/symbol",
+                    json!({
+                        "query": doc.symbol
+                    }),
+                    LSP_HEAVY_REQUEST_TIMEOUT,
+                    LSP_CONTENT_MODIFIED_RETRIES,
+                )
+                .await;
+            if let Ok(result) = ws_symbol {
+                metrics.workspace_symbol_success += 1;
+                if let Some(path) = lsp_workspace_symbol_path_for_item(
+                    &result,
+                    file_uri,
+                    &doc.symbol,
+                    doc.start_line,
+                ) {
+                    doc.symbol_path = path;
+                    metrics.workspace_symbol_nonempty += 1;
+                }
+            } else {
+                metrics.workspace_symbol_failed += 1;
+            }
         }
     }
 
     Ok(())
+}
+
+fn should_extract_relations_for_symbol(doc: &RustItemDoc, bulk_mode: bool) -> bool {
+    match doc.kind.as_str() {
+        // Skip noisy/low-value leaf symbols for relation extraction.
+        "var" | "module" => false,
+        // During full/bulk scans, prioritize core API/type graph symbols.
+        "fn" | "struct" | "enum" | "trait" => true,
+        _ => !bulk_mode,
+    }
 }
 
 fn lsp_hover_to_text(result: &Value) -> Option<String> {
@@ -1841,6 +2386,54 @@ fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
         .get("label")
         .and_then(Value::as_str)
         .map(|v| v.trim().to_string())
+}
+
+fn lsp_workspace_symbol_path_for_item(
+    result: &Value,
+    file_uri: &str,
+    symbol: &str,
+    start_line: usize,
+) -> Option<String> {
+    let items = result.as_array()?;
+    let mut best: Option<(usize, String)> = None;
+    for item in items {
+        let name = item.get("name").and_then(Value::as_str)?;
+        if name != symbol {
+            continue;
+        }
+        let uri = item
+            .get("location")
+            .and_then(|v| v.get("uri"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                item.get("location")
+                    .and_then(|v| v.get("targetUri"))
+                    .and_then(Value::as_str)
+            })?;
+        if uri != file_uri {
+            continue;
+        }
+        let line = item
+            .get("location")
+            .and_then(|v| v.get("range"))
+            .and_then(|v| v.get("start"))
+            .and_then(|v| v.get("line"))
+            .and_then(Value::as_u64)
+            .map(|v| v as usize + 1)
+            .unwrap_or(start_line);
+        let distance = line.abs_diff(start_line);
+        let candidate = item
+            .get("containerName")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(|container| format!("{container}::{name}"))
+            .unwrap_or_else(|| name.to_string());
+        match &best {
+            Some((d, _)) if *d <= distance => {}
+            _ => best = Some((distance, candidate)),
+        }
+    }
+    best.map(|(_, v)| v)
 }
 
 fn lsp_marked_content_to_text(contents: &Value) -> Option<String> {
@@ -2030,6 +2623,9 @@ fn collect_lsp_symbol_docs(
             workspace_id: workspace_id.to_string(),
             uri: uri.to_string(),
             module: module.to_string(),
+            symbol_path: format!("{module}::{name}"),
+            crate_name: String::new(),
+            edition: String::new(),
             signature,
             docs,
             hover_summary: String::new(),
@@ -2104,11 +2700,14 @@ fn extract_symbol_docs_heuristic(
         docs.push(RustItemDoc {
             id,
             kind: kind.to_string(),
-            symbol,
+            symbol: symbol.clone(),
             file_path: file_path.to_string(),
             workspace_id: workspace_id.to_string(),
             uri: uri.to_string(),
             module: module.clone(),
+            symbol_path: format!("{module}::{symbol}"),
+            crate_name: String::new(),
+            edition: String::new(),
             signature,
             docs: item_docs,
             hover_summary: String::new(),
@@ -2150,6 +2749,37 @@ fn symbol_docs_to_chunks(docs: &[RustItemDoc]) -> Vec<CodeChunk> {
             }
         })
         .collect()
+}
+
+fn find_crate_metadata_for_file<'a>(
+    metadata_by_crate: &'a HashMap<String, CrateMetadataDoc>,
+    file_path: &str,
+) -> Option<&'a CrateMetadataDoc> {
+    metadata_by_crate
+        .iter()
+        .filter(|(root, _)| root.is_empty() || file_path.starts_with(root.as_str()))
+        .max_by_key(|(root, _)| root.len())
+        .map(|(_, doc)| doc)
+}
+
+fn apply_crate_metadata_to_symbol_docs(docs: &mut [RustItemDoc], meta: &CrateMetadataDoc) {
+    for doc in docs {
+        doc.crate_name = meta.crate_name.clone();
+        doc.edition = meta.edition.clone();
+        if doc.symbol_path.is_empty() {
+            doc.symbol_path = if doc.module.is_empty() {
+                doc.symbol.clone()
+            } else {
+                format!("{}::{}", doc.module, doc.symbol)
+            };
+        }
+    }
+}
+
+fn apply_crate_metadata_to_relation_docs(docs: &mut [SymbolRelationDoc], meta: &CrateMetadataDoc) {
+    for doc in docs {
+        doc.source_crate_name = meta.crate_name.clone();
+    }
 }
 
 fn module_from_file_path(file_path: &str) -> String {
@@ -2323,6 +2953,9 @@ mod tests {
             workspace_id: "ws_test".to_string(),
             uri: "file:///tmp/ws/src/main.rs".to_string(),
             module: "src::main".to_string(),
+            symbol_path: format!("src::main::{symbol}"),
+            crate_name: "example_crate".to_string(),
+            edition: "2024".to_string(),
             signature: format!("fn {symbol}() {{}}"),
             docs: String::new(),
             hover_summary: String::new(),
@@ -2450,6 +3083,9 @@ pub struct Thing {
             workspace_id: "ws_test".to_string(),
             uri: "file:///tmp/ws/src/lib.rs".to_string(),
             module: "src::lib".to_string(),
+            symbol_path: "src::lib::add".to_string(),
+            crate_name: "example_crate".to_string(),
+            edition: "2024".to_string(),
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
@@ -2474,6 +3110,9 @@ pub struct Thing {
             workspace_id: "ws_test".to_string(),
             uri: "file:///tmp/ws/src/lib.rs".to_string(),
             module: "src::lib".to_string(),
+            symbol_path: "src::lib::add".to_string(),
+            crate_name: "example_crate".to_string(),
+            edition: "2024".to_string(),
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),

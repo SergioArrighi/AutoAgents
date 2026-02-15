@@ -83,6 +83,7 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
             "tools": [
                 "search_code",
                 "search_relations",
+                "workspace_metadata",
                 "get_file_chunks",
                 "get_symbol_context",
                 "get_symbol_relations",
@@ -91,6 +92,7 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
             ]
         })),
         ("GET", "/mcp/tools/index_status") => handle_mcp_index_status(app).await,
+        ("GET", "/mcp/tools/workspace_metadata") => handle_mcp_workspace_metadata(app).await,
         ("POST", "/mcp/tools/search_code") => match parse_json_body::<SearchCodeRequest>(body) {
             Ok(req) => handle_mcp_search_code(app, req).await,
             Err(err) => Err(err),
@@ -171,6 +173,15 @@ async fn handle_mcp_index_status(app: App) -> Result<Value, RpcError> {
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": status.indexing_in_progress,
         "status": status,
+    }))
+}
+
+async fn handle_mcp_workspace_metadata(app: App) -> Result<Value, RpcError> {
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "workspace_metadata": state.workspace_metadata,
     }))
 }
 
