@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug rust_copilot_agent",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--package=rust-copilot-daemon",
+                    "--bin=rust-copilot-daemon"
+                ],
+                "filter": {
+                    "name": "rust-copilot-daemon",
+                    "kind": "bin"
+                }
+            },
+            "args": ["--usecase", "interactive"],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"],
+            "env": {
+                "OLLAMA_BASE_URL": "http://192.168.1.69:11434",
+                "RUST_LOG": "debug"
+            }
+        }
+    ]
+}

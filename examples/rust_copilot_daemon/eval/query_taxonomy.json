@@ -1,0 +1,17 @@
+{
+  "version": "2026-02-15",
+  "task_classes": [
+    "symbol_lookup",
+    "api_usage",
+    "refactor_support",
+    "diagnostics_fixing",
+    "test_authoring"
+  ],
+  "query_fields": [
+    "query",
+    "task_class",
+    "expected_symbol_ids",
+    "expected_file_paths",
+    "top_k"
+  ]
+}

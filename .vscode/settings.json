@@ -1,0 +1,9 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "examples/rust_copilot_daemon/Cargo.toml"
+  ],
+  "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.check.workspace": false,
+  "rust-analyzer.cargo.buildScripts.enable": false
+}

@@ -5,6 +5,7 @@ use autoagents_core::vector_store::{NamedVectorDocument, VectorStoreIndex};
 use autoagents_llm::backends::ollama::Ollama;
 use autoagents_llm::embedding::EmbeddingBuilder;
 use autoagents_qdrant::QdrantVectorStore;
+use lsp_types::SymbolKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -146,8 +147,8 @@ struct RustItemDoc {
     docs: String,
     /// Hover payload extracted from rust-analyzer.
     hover_summary: String,
-    /// Signature help summary extracted from rust-analyzer.
-    signature_help: String,
+    // /// Signature help summary extracted from rust-analyzer.
+    // signature_help: String,
     /// Short source excerpt for additional context.
     body_excerpt: String,
     /// Inclusive start line (1-based).
@@ -274,8 +275,8 @@ struct ExtractionMetrics {
     workspace_symbol_success_total: u64,
     workspace_symbol_failed_total: u64,
     workspace_symbol_nonempty_total: u64,
-    signature_help_success_total: u64,
-    signature_help_failed_total: u64,
+    // signature_help_success_total: u64,
+    // signature_help_failed_total: u64,
     references_success_total: u64,
     references_failed_total: u64,
     references_nonempty_total: u64,
@@ -306,8 +307,8 @@ struct FileExtractionMetrics {
     workspace_symbol_success: u64,
     workspace_symbol_failed: u64,
     workspace_symbol_nonempty: u64,
-    signature_help_success: u64,
-    signature_help_failed: u64,
+    // signature_help_success: u64,
+    // signature_help_failed: u64,
     references_success: u64,
     references_failed: u64,
     references_nonempty: u64,
@@ -914,7 +915,7 @@ async fn main() -> Result<()> {
         stop_tx: stop_tx.clone(),
     };
 
-    let mcp_listener = TcpListener::bind("127.0.0.1:0")
+    let mcp_listener: TcpListener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("failed to bind MCP endpoint")?;
     let mcp_addr = mcp_listener.local_addr()?;
@@ -1348,8 +1349,8 @@ async fn reindex_file(
     metrics.workspace_symbol_success_total += file_metrics.workspace_symbol_success;
     metrics.workspace_symbol_failed_total += file_metrics.workspace_symbol_failed;
     metrics.workspace_symbol_nonempty_total += file_metrics.workspace_symbol_nonempty;
-    metrics.signature_help_success_total += file_metrics.signature_help_success;
-    metrics.signature_help_failed_total += file_metrics.signature_help_failed;
+    // metrics.signature_help_success_total += file_metrics.signature_help_success;
+    // metrics.signature_help_failed_total += file_metrics.signature_help_failed;
     metrics.references_success_total += file_metrics.references_success;
     metrics.references_failed_total += file_metrics.references_failed;
     metrics.references_nonempty_total += file_metrics.references_nonempty;
@@ -1453,7 +1454,7 @@ fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<RustItemDoc> {
                 .to_string(),
             docs: String::new(),
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt: chunk.text.clone(),
             start_line: chunk.start_line,
             end_line: chunk.end_line,
@@ -1479,7 +1480,7 @@ fn chunk_rust_file(
 
     let chunk_size = 80usize;
     let overlap = 10usize;
-    let mut chunks = Vec::new();
+    let mut chunks: Vec<CodeChunk> = Vec::new();
     let mut i = 0usize;
 
     while i < lines.len() {
@@ -1629,11 +1630,12 @@ fn derive_workspace_id(workspace_root: &Path) -> String {
 
 fn rust_item_search_text(doc: &RustItemDoc) -> String {
     format!(
-        "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        // "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        "{symbol}\n{symbol_path}\n{signature}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
         symbol = doc.symbol,
         symbol_path = doc.symbol_path,
         signature = doc.signature,
-        signature_help = doc.signature_help,
+        // signature_help = doc.signature_help,
         docs = doc.docs,
         hover_summary = doc.hover_summary,
         body_excerpt = doc.body_excerpt,
@@ -1675,9 +1677,10 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
         (
             SIGNATURE_VECTOR_NAME.to_string(),
             format!(
-                "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                // "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                "{signature}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
                 signature = doc.signature,
-                signature_help = doc.signature_help,
+                // signature_help = doc.signature_help,
                 symbol = doc.symbol,
                 kind = doc.kind,
                 module = doc.module,
@@ -2294,7 +2297,7 @@ async fn enrich_docs_with_lsp_metadata(
     metrics: &mut FileExtractionMetrics,
 ) -> Result<()> {
     for doc in docs {
-        let line = doc.start_line.saturating_sub(1);
+        let line = doc.start_line;
 
         let hover = session
             .request_with_retry(
@@ -2313,6 +2316,8 @@ async fn enrich_docs_with_lsp_metadata(
         } else {
             metrics.hover_failed += 1;
         }
+        /*
+        // signature_help is more often than not null
         if doc.kind == "fn" {
             let signature_help = session
                 .request_with_retry(
@@ -2332,6 +2337,7 @@ async fn enrich_docs_with_lsp_metadata(
                 metrics.signature_help_failed += 1;
             }
         }
+        */
 
         if !bulk_mode {
             let ws_symbol = session
@@ -2379,14 +2385,14 @@ fn lsp_hover_to_text(result: &Value) -> Option<String> {
     lsp_marked_content_to_text(contents)
 }
 
-fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
-    let signatures = result.get("signatures")?.as_array()?;
-    let first = signatures.first()?;
-    first
-        .get("label")
-        .and_then(Value::as_str)
-        .map(|v| v.trim().to_string())
-}
+// fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
+//     let signatures = result.get("signatures")?.as_array()?;
+//     let first = signatures.first()?;
+//     first
+//         .get("label")
+//         .and_then(Value::as_str)
+//         .map(|v| v.trim().to_string())
+// }
 
 fn lsp_workspace_symbol_path_for_item(
     result: &Value,
@@ -2567,7 +2573,7 @@ fn parse_lsp_symbols(
         return Vec::new();
     };
 
-    let lines = content.lines().collect::<Vec<_>>();
+    let lines: Vec<&str> = content.lines().collect::<Vec<_>>();
     let module = module_from_file_path(file_path);
     let mut out = Vec::new();
 
@@ -2607,12 +2613,11 @@ fn collect_lsp_symbol_docs(
         .to_string();
 
     if let Some((start_line, end_line)) = lsp_symbol_line_range(item) {
-        let sig_idx = start_line
-            .saturating_sub(1)
-            .min(lines.len().saturating_sub(1));
+        let sig_idx = start_line;
+
         let signature = lines.get(sig_idx).copied().unwrap_or("").trim().to_string();
         let docs = collect_docs_above(lines, sig_idx);
-        let excerpt = excerpt_from_range(lines, sig_idx, end_line.saturating_sub(1), 60);
+        let excerpt = excerpt_from_range(lines, sig_idx, end_line, 60);
         let id = format!("symbol:{workspace_id}:{file_path}:{kind}:{name}:{start_line}:{end_line}");
 
         out.push(RustItemDoc {
@@ -2629,7 +2634,7 @@ fn collect_lsp_symbol_docs(
             signature,
             docs,
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt: excerpt,
             start_line,
             end_line,
@@ -2647,23 +2652,54 @@ fn lsp_symbol_line_range(item: &Value) -> Option<(usize, usize)> {
     let range = item
         .get("range")
         .or_else(|| item.get("location").and_then(|loc| loc.get("range")))?;
-    let start = range.get("start")?.get("line")?.as_u64()? as usize + 1;
+    let start = item
+        .get("selectionRange")
+        .or_else(|| item.get("location").and_then(|loc| loc.get("selectionRange")))
+        .and_then(|sel| sel.get("start"))
+        .and_then(|start| start.get("line"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            range
+                .get("start")
+                .and_then(|start| start.get("line"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        }) as usize
+        + 1;
     let end = range.get("end")?.get("line")?.as_u64()? as usize + 1;
     Some((start, end.max(start)))
 }
 
 fn symbol_kind_to_kind(kind: i64) -> &'static str {
-    match kind {
-        2 => "mod",
-        5 => "struct",
-        6 => "fn",
-        10 => "enum",
-        11 => "trait",
-        12 => "fn",
-        13 => "var",
-        14 => "const",
-        23 => "struct",
-        _ => "module",
+    let symbol_kind = serde_json::from_value::<SymbolKind>(Value::from(kind)).ok();
+    match symbol_kind {
+        Some(SymbolKind::FILE) => "file",
+        Some(SymbolKind::MODULE) => "mod",
+        Some(SymbolKind::NAMESPACE) => "namespace",
+        Some(SymbolKind::PACKAGE) => "package",
+        Some(SymbolKind::CLASS) => "struct",
+        Some(SymbolKind::METHOD) => "method",
+        Some(SymbolKind::PROPERTY) => "property",
+        Some(SymbolKind::FIELD) => "field",
+        Some(SymbolKind::CONSTRUCTOR) => "ctor",
+        Some(SymbolKind::ENUM) => "enum",
+        Some(SymbolKind::INTERFACE) => "trait",
+        Some(SymbolKind::FUNCTION) => "fn",
+        Some(SymbolKind::VARIABLE) => "var",
+        Some(SymbolKind::CONSTANT) => "const",
+        Some(SymbolKind::STRING) => "string",
+        Some(SymbolKind::NUMBER) => "number",
+        Some(SymbolKind::BOOLEAN) => "bool",
+        Some(SymbolKind::ARRAY) => "array",
+        Some(SymbolKind::OBJECT) => "object",
+        Some(SymbolKind::KEY) => "key",
+        Some(SymbolKind::NULL) => "null",
+        Some(SymbolKind::ENUM_MEMBER) => "enum_member",
+        Some(SymbolKind::STRUCT) => "struct",
+        Some(SymbolKind::EVENT) => "event",
+        Some(SymbolKind::OPERATOR) => "operator",
+        Some(SymbolKind::TYPE_PARAMETER) => "type_param",
+        _ => "symbol",
     }
 }
 
@@ -2711,7 +2747,7 @@ fn extract_symbol_docs_heuristic(
             signature,
             docs: item_docs,
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt,
             start_line,
             end_line,
@@ -2727,11 +2763,12 @@ fn symbol_docs_to_chunks(docs: &[RustItemDoc]) -> Vec<CodeChunk> {
     docs.iter()
         .map(|doc| {
             let text = format!(
-                "symbol: {}\nkind: {}\nsignature: {}\nsignature_help: {}\ndocs:\n{}\nhover:\n{}\n\nexcerpt:\n{}",
+                // "symbol: {}\nkind: {}\nsignature: {}\nsignature_help: {}\ndocs:\n{}\nhover:\n{}\n\nexcerpt:\n{}",
+                "symbol: {}\nkind: {}\nsignature: {}\ndocs:\n{}\nhover:\n{}\n\nexcerpt:\n{}",
                 doc.symbol,
                 doc.kind,
                 doc.signature,
-                doc.signature_help,
+                // doc.signature_help,
                 doc.docs,
                 doc.hover_summary,
                 doc.body_excerpt
@@ -2959,7 +2996,7 @@ mod tests {
             signature: format!("fn {symbol}() {{}}"),
             docs: String::new(),
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt: excerpt.to_string(),
             start_line: 1,
             end_line: 3,
@@ -3089,7 +3126,7 @@ pub struct Thing {
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
-            signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
+            // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             end_line: 3,
@@ -3116,7 +3153,7 @@ pub struct Thing {
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
-            signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
+            // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             end_line: 3,
