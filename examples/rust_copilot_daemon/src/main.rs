@@ -148,11 +148,14 @@ struct RustItemDoc {
     /// Hover payload extracted from rust-analyzer.
     hover_summary: String,
     // /// Signature help summary extracted from rust-analyzer.
-    // signature_help: String,
+    signature_help: String,
     /// Short source excerpt for additional context.
     body_excerpt: String,
     /// Inclusive start line (1-based).
     start_line: usize,
+    /// Start character (0-based, UTF-16 code units) for precise LSP positioning.
+    #[serde(default)]
+    start_character: usize,
     /// Inclusive end line (1-based).
     end_line: usize,
 }
@@ -307,8 +310,8 @@ struct FileExtractionMetrics {
     workspace_symbol_success: u64,
     workspace_symbol_failed: u64,
     workspace_symbol_nonempty: u64,
-    // signature_help_success: u64,
-    // signature_help_failed: u64,
+    signature_help_success: u64,
+    signature_help_failed: u64,
     references_success: u64,
     references_failed: u64,
     references_nonempty: u64,
@@ -479,14 +482,19 @@ impl RaSessionManager {
 
         let session = self.ensure_session(workspace_root).await?;
         session.sync_document(&file_uri, content).await?;
-        let result = session
-            .request(
+        let Some(result) = session
+            .request_if_supported(
                 "textDocument/documentSymbol",
                 json!({
                     "textDocument": { "uri": file_uri }
                 }),
+                LSP_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         let mut docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
         enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs, bulk_mode, metrics).await?;
         Ok(docs)
@@ -542,6 +550,7 @@ struct RaLspSession {
     reader: BufReader<ChildStdout>,
     next_id: i64,
     open_doc_versions: HashMap<String, i64>,
+    unsupported_methods: HashSet<String>,
     content_modified_retries_total: u64,
     request_timeouts_total: u64,
 }
@@ -575,6 +584,7 @@ impl RaLspSession {
             reader: BufReader::new(stdout),
             next_id: 1,
             open_doc_versions: HashMap::new(),
+            unsupported_methods: HashSet::new(),
             content_modified_retries_total: 0,
             request_timeouts_total: 0,
         };
@@ -586,7 +596,15 @@ impl RaLspSession {
                 json!({
                     "processId": null,
                     "rootUri": workspace_uri,
-                    "capabilities": {}
+                    "capabilities": {
+                        "textDocument": {
+                            "documentSymbol": {
+                                "dynamicRegistration": false,
+                                "hierarchicalDocumentSymbolSupport": true,
+                                "labelSupport": true
+                            }
+                        }
+                    }
                 }),
             )
             .await?;
@@ -673,6 +691,30 @@ impl RaLspSession {
         })?
     }
 
+    async fn request_if_supported(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        retries: usize,
+    ) -> Result<Option<Value>> {
+        if self.unsupported_methods.contains(method) {
+            return Ok(None);
+        }
+
+        match self
+            .request_with_retry(method, params, timeout, retries)
+            .await
+        {
+            Ok(v) => Ok(Some(v)),
+            Err(err) if is_method_unsupported_error(&err) => {
+                self.unsupported_methods.insert(method.to_string());
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn sync_document(&mut self, file_uri: &str, content: &str) -> Result<()> {
         if let Some(current) = self.open_doc_versions.get(file_uri).copied() {
             let new_version = current + 1;
@@ -740,6 +782,13 @@ impl RaLspSession {
 fn is_content_modified_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
     message.contains("\"code\":-32801") || message.contains("content modified")
+}
+
+fn is_method_unsupported_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("\"code\":-32601")
+        || message.contains("Method not found")
+        || message.contains("method not found")
 }
 
 /// JSON-RPC request envelope.
@@ -1090,12 +1139,7 @@ async fn process_batch(app: App, events: Vec<DirtyEvent>) {
 }
 
 /// Reads and re-indexes one Rust file into Qdrant and local cache.
-async fn reindex_file(
-    app: &App,
-    services: &Services,
-    path: &Path,
-    bulk_mode: bool,
-) -> Result<()> {
+async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bool) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
@@ -1454,9 +1498,10 @@ fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<RustItemDoc> {
                 .to_string(),
             docs: String::new(),
             hover_summary: String::new(),
-            // signature_help: String::new(),
+            signature_help: String::new(),
             body_excerpt: chunk.text.clone(),
             start_line: chunk.start_line,
+            start_character: 0,
             end_line: chunk.end_line,
         })
         .collect()
@@ -1630,12 +1675,11 @@ fn derive_workspace_id(workspace_root: &Path) -> String {
 
 fn rust_item_search_text(doc: &RustItemDoc) -> String {
     format!(
-        // "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
-        "{symbol}\n{symbol_path}\n{signature}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
         symbol = doc.symbol,
         symbol_path = doc.symbol_path,
         signature = doc.signature,
-        // signature_help = doc.signature_help,
+        signature_help = doc.signature_help,
         docs = doc.docs,
         hover_summary = doc.hover_summary,
         body_excerpt = doc.body_excerpt,
@@ -1677,10 +1721,10 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
         (
             SIGNATURE_VECTOR_NAME.to_string(),
             format!(
-                // "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
-                "{signature}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+
                 signature = doc.signature,
-                // signature_help = doc.signature_help,
+                signature_help = doc.signature_help,
                 symbol = doc.symbol,
                 kind = doc.kind,
                 module = doc.module,
@@ -1984,11 +2028,13 @@ async fn extract_symbol_relations_with_lsp(
         if !should_extract_relations_for_symbol(doc, bulk_mode) {
             continue;
         }
-        let line = doc.start_line.saturating_sub(1);
-        let position = json!({ "line": line, "character": 0 });
+        let position = json!({
+            "line": doc.start_line,
+            "character": doc.start_character
+        });
 
         let references = session
-            .request_with_retry(
+            .request_if_supported(
                 "textDocument/references",
                 json!({
                     "textDocument": { "uri": file_uri },
@@ -1999,7 +2045,7 @@ async fn extract_symbol_relations_with_lsp(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
-        if let Ok(references) = references {
+        if let Ok(Some(references)) = references {
             metrics.references_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2018,11 +2064,11 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.references_nonempty += 1;
             }
             metrics.relations_references_emitted += emitted as u64;
-        } else {
+        } else if references.is_err() {
             metrics.references_failed += 1;
         }
         let implementations = session
-            .request_with_retry(
+            .request_if_supported(
                 "textDocument/implementation",
                 json!({
                     "textDocument": { "uri": file_uri },
@@ -2032,7 +2078,7 @@ async fn extract_symbol_relations_with_lsp(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
-        if let Ok(implementations) = implementations {
+        if let Ok(Some(implementations)) = implementations {
             metrics.implementations_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2051,11 +2097,11 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.implementations_nonempty += 1;
             }
             metrics.relations_implementations_emitted += emitted as u64;
-        } else {
+        } else if implementations.is_err() {
             metrics.implementations_failed += 1;
         }
         let definitions = session
-            .request_with_retry(
+            .request_if_supported(
                 "textDocument/definition",
                 json!({
                     "textDocument": { "uri": file_uri },
@@ -2065,7 +2111,7 @@ async fn extract_symbol_relations_with_lsp(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
-        if let Ok(definitions) = definitions {
+        if let Ok(Some(definitions)) = definitions {
             metrics.definitions_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2084,11 +2130,11 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.definitions_nonempty += 1;
             }
             metrics.relations_definitions_emitted += emitted as u64;
-        } else {
+        } else if definitions.is_err() {
             metrics.definitions_failed += 1;
         }
         let type_definitions = session
-            .request_with_retry(
+            .request_if_supported(
                 "textDocument/typeDefinition",
                 json!({
                     "textDocument": { "uri": file_uri },
@@ -2098,7 +2144,7 @@ async fn extract_symbol_relations_with_lsp(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
-        if let Ok(type_definitions) = type_definitions {
+        if let Ok(Some(type_definitions)) = type_definitions {
             metrics.type_definitions_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2117,7 +2163,7 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.type_definitions_nonempty += 1;
             }
             metrics.relations_type_definitions_emitted += emitted as u64;
-        } else {
+        } else if type_definitions.is_err() {
             metrics.type_definitions_failed += 1;
         }
     }
@@ -2297,26 +2343,28 @@ async fn enrich_docs_with_lsp_metadata(
     metrics: &mut FileExtractionMetrics,
 ) -> Result<()> {
     for doc in docs {
-        let line = doc.start_line;
+        let position = json!({
+            "line": doc.start_line.saturating_sub(1),
+            "character": doc.start_character
+        });
 
         let hover = session
-            .request_with_retry(
+            .request_if_supported(
                 "textDocument/hover",
                 json!({
                     "textDocument": { "uri": file_uri },
-                    "position": { "line": line, "character": 0 }
+                    "position": position
                 }),
                 LSP_REQUEST_TIMEOUT,
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
-        if let Ok(hover) = hover {
+        if let Ok(Some(hover)) = hover {
             metrics.hover_success += 1;
             doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
-        } else {
+        } else if hover.is_err() {
             metrics.hover_failed += 1;
         }
-        /*
         // signature_help is more often than not null
         if doc.kind == "fn" {
             let signature_help = session
@@ -2324,7 +2372,7 @@ async fn enrich_docs_with_lsp_metadata(
                     "textDocument/signatureHelp",
                     json!({
                         "textDocument": { "uri": file_uri },
-                        "position": { "line": line, "character": 0 }
+                        "position": position
                     }),
                     LSP_REQUEST_TIMEOUT,
                     LSP_CONTENT_MODIFIED_RETRIES,
@@ -2337,11 +2385,10 @@ async fn enrich_docs_with_lsp_metadata(
                 metrics.signature_help_failed += 1;
             }
         }
-        */
 
         if !bulk_mode {
             let ws_symbol = session
-                .request_with_retry(
+                .request_if_supported(
                     "workspace/symbol",
                     json!({
                         "query": doc.symbol
@@ -2350,7 +2397,7 @@ async fn enrich_docs_with_lsp_metadata(
                     LSP_CONTENT_MODIFIED_RETRIES,
                 )
                 .await;
-            if let Ok(result) = ws_symbol {
+            if let Ok(Some(result)) = ws_symbol {
                 metrics.workspace_symbol_success += 1;
                 if let Some(path) = lsp_workspace_symbol_path_for_item(
                     &result,
@@ -2361,7 +2408,7 @@ async fn enrich_docs_with_lsp_metadata(
                     doc.symbol_path = path;
                     metrics.workspace_symbol_nonempty += 1;
                 }
-            } else {
+            } else if ws_symbol.is_err() {
                 metrics.workspace_symbol_failed += 1;
             }
         }
@@ -2385,14 +2432,14 @@ fn lsp_hover_to_text(result: &Value) -> Option<String> {
     lsp_marked_content_to_text(contents)
 }
 
-// fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
-//     let signatures = result.get("signatures")?.as_array()?;
-//     let first = signatures.first()?;
-//     first
-//         .get("label")
-//         .and_then(Value::as_str)
-//         .map(|v| v.trim().to_string())
-// }
+fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
+    let signatures = result.get("signatures")?.as_array()?;
+    let first = signatures.first()?;
+    first
+        .get("label")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_string())
+}
 
 fn lsp_workspace_symbol_path_for_item(
     result: &Value,
@@ -2578,6 +2625,7 @@ fn parse_lsp_symbols(
     let mut out = Vec::new();
 
     for item in items {
+        //dbg!(item);
         collect_lsp_symbol_docs(
             item,
             workspace_id,
@@ -2612,12 +2660,21 @@ fn collect_lsp_symbol_docs(
         .unwrap_or("module")
         .to_string();
 
-    if let Some((start_line, end_line)) = lsp_symbol_line_range(item) {
-        let sig_idx = start_line;
+    if let Some((start_line, start_character, end_line)) = lsp_symbol_position_range(item) {
+        let (resolved_start_line, resolved_start_character) =
+            symbol_position_in_lsp_range(lines, name, start_line, end_line)
+                .unwrap_or((start_line, start_character));
+        let sig_idx = resolved_start_line.saturating_sub(1);
+        let signature_line = lines.get(sig_idx).copied().unwrap_or("");
+        let resolved_start_character = if resolved_start_character == 0 {
+            symbol_start_character(signature_line, name)
+        } else {
+            resolved_start_character
+        };
 
-        let signature = lines.get(sig_idx).copied().unwrap_or("").trim().to_string();
+        let signature = signature_line.trim().to_string();
         let docs = collect_docs_above(lines, sig_idx);
-        let excerpt = excerpt_from_range(lines, sig_idx, end_line, 60);
+        let excerpt = excerpt_from_range(lines, sig_idx, end_line.saturating_sub(1), 60);
         let id = format!("symbol:{workspace_id}:{file_path}:{kind}:{name}:{start_line}:{end_line}");
 
         out.push(RustItemDoc {
@@ -2634,9 +2691,10 @@ fn collect_lsp_symbol_docs(
             signature,
             docs,
             hover_summary: String::new(),
-            // signature_help: String::new(),
+            signature_help: String::new(),
             body_excerpt: excerpt,
-            start_line,
+            start_line: resolved_start_line,
+            start_character: resolved_start_character,
             end_line,
         });
     }
@@ -2648,26 +2706,41 @@ fn collect_lsp_symbol_docs(
     }
 }
 
-fn lsp_symbol_line_range(item: &Value) -> Option<(usize, usize)> {
+fn lsp_symbol_position_range(item: &Value) -> Option<(usize, usize, usize)> {
     let range = item
         .get("range")
         .or_else(|| item.get("location").and_then(|loc| loc.get("range")))?;
-    let start = item
-        .get("selectionRange")
-        .or_else(|| item.get("location").and_then(|loc| loc.get("selectionRange")))
+
+    let selection_range = item.get("selectionRange").or_else(|| {
+        item.get("location")
+            .and_then(|loc| loc.get("selectionRange"))
+    });
+
+    let start = selection_range
         .and_then(|sel| sel.get("start"))
         .and_then(|start| start.get("line"))
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             range
                 .get("start")
                 .and_then(|start| start.get("line"))
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
-        }) as usize
-        + 1;
+        })
+        .unwrap_or(0) as usize;
+        //+ 1;
+    let start_character = selection_range
+        .and_then(|sel| sel.get("start"))
+        .and_then(|start| start.get("character"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            range
+                .get("start")
+                .and_then(|start| start.get("character"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0) as usize;
     let end = range.get("end")?.get("line")?.as_u64()? as usize + 1;
-    Some((start, end.max(start)))
+    Some((start, start_character, end.max(start)))
 }
 
 fn symbol_kind_to_kind(kind: i64) -> &'static str {
@@ -2747,9 +2820,10 @@ fn extract_symbol_docs_heuristic(
             signature,
             docs: item_docs,
             hover_summary: String::new(),
-            // signature_help: String::new(),
+            signature_help: String::new(),
             body_excerpt,
             start_line,
+            start_character: symbol_start_character(lines[line_idx], &symbol),
             end_line,
         });
 
@@ -2952,6 +3026,77 @@ fn find_item_end_line(lines: &[&str], start_idx: usize) -> usize {
     lines.len()
 }
 
+fn symbol_start_character(line: &str, symbol: &str) -> usize {
+    if symbol.is_empty() {
+        return first_non_whitespace_character(line);
+    }
+
+    for (idx, _) in line.match_indices(symbol) {
+        if symbol_match_is_isolated(line, idx, symbol.len()) {
+            return utf16_character_offset(line, idx);
+        }
+    }
+
+    line.find(symbol)
+        .map(|idx| utf16_character_offset(line, idx))
+        .unwrap_or_else(|| first_non_whitespace_character(line))
+}
+
+fn symbol_position_in_lsp_range(
+    lines: &[&str],
+    symbol: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<(usize, usize)> {
+    if lines.is_empty() || symbol.is_empty() {
+        return None;
+    }
+
+    let start_idx = start_line
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
+    let end_idx = end_line
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
+    if start_idx > end_idx {
+        return None;
+    }
+
+    for idx in start_idx..=end_idx {
+        let line = lines[idx];
+        for (byte_idx, _) in line.match_indices(symbol) {
+            if symbol_match_is_isolated(line, byte_idx, symbol.len()) {
+                return Some((idx + 1, utf16_character_offset(line, byte_idx)));
+            }
+        }
+    }
+
+    None
+}
+
+fn symbol_match_is_isolated(line: &str, start_idx: usize, symbol_len: usize) -> bool {
+    let prev = line[..start_idx].chars().next_back();
+    let next = line[start_idx + symbol_len..].chars().next();
+    !is_rust_ident_char(prev) && !is_rust_ident_char(next)
+}
+
+fn is_rust_ident_char(ch: Option<char>) -> bool {
+    matches!(ch, Some('_')) || ch.is_some_and(char::is_alphanumeric)
+}
+
+fn first_non_whitespace_character(line: &str) -> usize {
+    let byte_idx = line
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    utf16_character_offset(line, byte_idx)
+}
+
+fn utf16_character_offset(line: &str, byte_idx: usize) -> usize {
+    line[..byte_idx].encode_utf16().count()
+}
+
 fn excerpt_from_range(
     lines: &[&str],
     start_idx: usize,
@@ -2996,9 +3141,10 @@ mod tests {
             signature: format!("fn {symbol}() {{}}"),
             docs: String::new(),
             hover_summary: String::new(),
-            // signature_help: String::new(),
+            signature_help: String::new(),
             body_excerpt: excerpt.to_string(),
             start_line: 1,
+            start_character: 0,
             end_line: 3,
         }
     }
@@ -3129,6 +3275,7 @@ pub struct Thing {
             // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
+            start_character: 3,
             end_line: 3,
         }];
 
@@ -3153,9 +3300,10 @@ pub struct Thing {
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
-            // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
+            signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
+            start_character: 3,
             end_line: 3,
         };
 
@@ -3166,5 +3314,13 @@ pub struct Thing {
         assert!(search_text.contains("kind: fn"));
         assert!(search_text.contains("uri: file:///tmp/ws/src/lib.rs"));
         assert!(search_text.contains("workspace_id: ws_test"));
+    }
+
+    #[test]
+    fn method_not_found_error_is_detected() {
+        let err = anyhow::anyhow!(
+            "rust-analyzer returned error: {{\"code\":-32601,\"message\":\"Method not found\"}}"
+        );
+        assert!(is_method_unsupported_error(&err));
     }
 }

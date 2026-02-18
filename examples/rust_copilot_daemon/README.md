@@ -91,7 +91,7 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 - MCP responses include `schema_version`.
 - HTTP binds only to `127.0.0.1`.
 - rust-analyzer integration is session-based (persistent process per workspace) with `didOpen`/`didChange`/`didClose`.
-- Symbol extraction is enriched with LSP `documentSymbol`, `hover`, `signatureHelp`, and best-effort `workspace/symbol` path hints before vector upsert.
+- Symbol extraction is enriched with LSP `documentSymbol`, `hover`, and best-effort `workspace/symbol` path hints before vector upsert.
 - Cross-file relations are extracted via LSP `textDocument/references` and `textDocument/implementation` and persisted in a dedicated relation collection.
 - Additional relation edges are extracted via `textDocument/definition` and `textDocument/typeDefinition`.
 - Workspace Cargo metadata (crate name, edition, features, optional deps) is indexed and exposed via MCP.
