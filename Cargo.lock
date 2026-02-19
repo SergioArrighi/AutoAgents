@@ -7368,6 +7368,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-copilot-metrics-fixture"
+version = "0.1.0"
+
+[[package]]
 name = "rust-mcp-schema"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

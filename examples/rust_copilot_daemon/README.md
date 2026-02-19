@@ -39,6 +39,12 @@ ollama pull dengcao/Qwen3-Embedding-8B:Q4_K_M
 cargo run -p rust-copilot-daemon
 ```
 
+To pin MCP to a fixed localhost port:
+
+```bash
+MCP_PORT=43891 cargo run -p rust-copilot-daemon
+```
+
 At startup it prints MCP endpoint, for example:
 
 ```text
@@ -90,6 +96,7 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 - JSON-RPC returns `{protocol_version, daemon_version}` on initialize.
 - MCP responses include `schema_version`.
 - HTTP binds only to `127.0.0.1`.
+- MCP bind port comes from `MCP_PORT` (default `0`, meaning OS-assigned ephemeral port).
 - rust-analyzer integration is session-based (persistent process per workspace) with `didOpen`/`didChange`/`didClose`.
 - Symbol extraction is enriched with LSP `documentSymbol`, `hover`, and best-effort `workspace/symbol` path hints before vector upsert.
 - Cross-file relations are extracted via LSP `textDocument/references` and `textDocument/implementation` and persisted in a dedicated relation collection.
@@ -99,3 +106,20 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 ## Current limitation
 
 Type-level graph edges (`typeDefinition`, call hierarchy, trait bounds graph) are not yet persisted as dedicated relation documents.
+
+## Deterministic Metrics Fixture
+
+Use `examples/rust_copilot_metrics_fixture` to validate extraction behavior against a known baseline with real symbols and non-zero relation output.
+
+Expected metrics:
+
+- `examples/rust_copilot_daemon/eval/fixtures/rust_copilot_metrics_fixture.expected.json`
+
+Validation flow:
+
+1. `initialize` with `workspaceRoot` set to `examples/rust_copilot_metrics_fixture`.
+2. Send one `scan.full` with default globs.
+3. Wait for `status.indexing_in_progress=false` and `status.queue_depth=0`.
+4. Compare `status.extraction_metrics` to the expected JSON.
+
+Run against a fresh initialize/session because extraction metrics are cumulative.

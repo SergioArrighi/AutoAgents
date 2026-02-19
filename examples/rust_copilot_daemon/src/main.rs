@@ -59,6 +59,8 @@ struct RuntimeConfig {
     llm_model: String,
     /// Embedding model name.
     embedding_model: String,
+    /// MCP HTTP bind port (`0` means ephemeral).
+    mcp_port: u16,
 }
 
 impl Default for RuntimeConfig {
@@ -79,7 +81,16 @@ impl Default for RuntimeConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
             llm_model: "gpt-oss:20b".to_string(),
             embedding_model: "dengcao/Qwen3-Embedding-8B:Q4_K_M".to_string(),
+            mcp_port: parse_env_u16("MCP_PORT").unwrap_or(0),
         }
+    }
+}
+
+fn parse_env_u16(name: &str) -> Option<u16> {
+    let raw = std::env::var(name).ok()?;
+    match raw.parse::<u16>() {
+        Ok(value) => Some(value),
+        Err(_) => None
     }
 }
 
@@ -604,6 +615,12 @@ impl RaLspSession {
                                 "labelSupport": true
                             }
                         }
+                    },
+                    "initializationOptions": {
+                        "cargo": {
+                            "allTargets": true,
+                            "cfgs": ["test"]
+                        }
                     }
                 }),
             )
@@ -948,6 +965,7 @@ struct ExplainRelevanceRequest {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = RuntimeConfig::default();
+    let mcp_bind_addr = format!("127.0.0.1:{}", config.mcp_port);
     let services = build_services(&config)
         .await
         .context("failed to initialize Ollama embedding + Qdrant clients")?;
@@ -964,9 +982,9 @@ async fn main() -> Result<()> {
         stop_tx: stop_tx.clone(),
     };
 
-    let mcp_listener: TcpListener = TcpListener::bind("127.0.0.1:0")
+    let mcp_listener: TcpListener = TcpListener::bind(&mcp_bind_addr)
         .await
-        .context("failed to bind MCP endpoint")?;
+        .with_context(|| format!("failed to bind MCP endpoint at {mcp_bind_addr}"))?;
     let mcp_addr = mcp_listener.local_addr()?;
 
     eprintln!(
@@ -1116,6 +1134,12 @@ async fn process_batch(app: App, events: Vec<DirtyEvent>) {
         let queued_before = state.queue_depth;
         state.indexing_in_progress = true;
         state.queue_depth = state.queue_depth.saturating_sub(events.len());
+        eprintln!(
+            "indexer batch: events={} queued_before={} bulk_mode={}",
+            events.len(),
+            queued_before,
+            queued_before > BULK_SCAN_QUEUE_DEPTH_THRESHOLD || events.len() > 1
+        );
         queued_before > BULK_SCAN_QUEUE_DEPTH_THRESHOLD || events.len() > 1
     };
 
@@ -1160,6 +1184,12 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .unwrap_or(path)
         .to_string_lossy()
         .to_string();
+    eprintln!(
+        "reindex_file: ts_ms={} file_rel={} bulk_mode={}",
+        unix_ms_now(),
+        file_rel,
+        bulk_mode
+    );
 
     let (previous_ids, previous_relation_ids) = {
         let state = app.state.read().await;
@@ -1722,7 +1752,6 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
             SIGNATURE_VECTOR_NAME.to_string(),
             format!(
                 "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
-
                 signature = doc.signature,
                 signature_help = doc.signature_help,
                 symbol = doc.symbol,
@@ -2061,6 +2090,7 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await?;
             if emitted > 0 {
+                eprintln!("ref emitted {}", emitted);
                 metrics.references_nonempty += 1;
             }
             metrics.relations_references_emitted += emitted as u64;
@@ -2344,7 +2374,8 @@ async fn enrich_docs_with_lsp_metadata(
 ) -> Result<()> {
     for doc in docs {
         let position = json!({
-            "line": doc.start_line.saturating_sub(1),
+            //"line": doc.start_line.saturating_sub(1),
+            "line": doc.start_line,
             "character": doc.start_character
         });
 
@@ -2359,13 +2390,15 @@ async fn enrich_docs_with_lsp_metadata(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
+
         if let Ok(Some(hover)) = hover {
             metrics.hover_success += 1;
             doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
         } else if hover.is_err() {
             metrics.hover_failed += 1;
         }
-        // signature_help is more often than not null
+        // signature_help is more often than not null, mainly usefull for IDE scenarios
+        /*
         if doc.kind == "fn" {
             let signature_help = session
                 .request_with_retry(
@@ -2384,7 +2417,7 @@ async fn enrich_docs_with_lsp_metadata(
             } else {
                 metrics.signature_help_failed += 1;
             }
-        }
+        } */
 
         if !bulk_mode {
             let ws_symbol = session
@@ -2652,7 +2685,6 @@ fn collect_lsp_symbol_docs(
     let Some(name) = item.get("name").and_then(Value::as_str) else {
         return;
     };
-
     let kind = item
         .get("kind")
         .and_then(Value::as_i64)
@@ -2661,20 +2693,23 @@ fn collect_lsp_symbol_docs(
         .to_string();
 
     if let Some((start_line, start_character, end_line)) = lsp_symbol_position_range(item) {
-        let (resolved_start_line, resolved_start_character) =
-            symbol_position_in_lsp_range(lines, name, start_line, end_line)
-                .unwrap_or((start_line, start_character));
-        let sig_idx = resolved_start_line.saturating_sub(1);
-        let signature_line = lines.get(sig_idx).copied().unwrap_or("");
-        let resolved_start_character = if resolved_start_character == 0 {
-            symbol_start_character(signature_line, name)
-        } else {
-            resolved_start_character
-        };
+        //let (resolved_start_line, resolved_start_character) =
+        //    symbol_position_in_lsp_range(lines, name, start_line, end_line)
+        //        .unwrap_or((start_line, start_character));
+        //let sig_idx = resolved_start_line.saturating_sub(1);
+        //let signature_line = lines.get(sig_idx).copied().unwrap_or("");
+        let signature_line = lines.get(start_line).copied().unwrap_or("");
+        //let resolved_start_character = if resolved_start_character == 0 {
+        //    symbol_start_character(signature_line, name)
+        //} else {
+        //    resolved_start_character
+        //};
 
         let signature = signature_line.trim().to_string();
-        let docs = collect_docs_above(lines, sig_idx);
-        let excerpt = excerpt_from_range(lines, sig_idx, end_line.saturating_sub(1), 60);
+        //let docs = collect_docs_above(lines, sig_idx);
+        let docs = collect_docs_above(lines, start_line);
+        //let excerpt = excerpt_from_range(lines, sig_idx, end_line.saturating_sub(1), 60);
+        let excerpt = excerpt_from_range(lines, start_line, end_line, 60);
         let id = format!("symbol:{workspace_id}:{file_path}:{kind}:{name}:{start_line}:{end_line}");
 
         out.push(RustItemDoc {
@@ -2693,8 +2728,10 @@ fn collect_lsp_symbol_docs(
             hover_summary: String::new(),
             signature_help: String::new(),
             body_excerpt: excerpt,
-            start_line: resolved_start_line,
-            start_character: resolved_start_character,
+            //start_line: resolved_start_line,
+            start_line,
+            //start_character: resolved_start_character,
+            start_character,
             end_line,
         });
     }
@@ -2727,7 +2764,7 @@ fn lsp_symbol_position_range(item: &Value) -> Option<(usize, usize, usize)> {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0) as usize;
-        //+ 1;
+    //+ 1;
     let start_character = selection_range
         .and_then(|sel| sel.get("start"))
         .and_then(|start| start.get("character"))
@@ -2739,7 +2776,7 @@ fn lsp_symbol_position_range(item: &Value) -> Option<(usize, usize, usize)> {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0) as usize;
-    let end = range.get("end")?.get("line")?.as_u64()? as usize + 1;
+    let end = range.get("end")?.get("line")?.as_u64()? as usize; // + 1;
     Some((start, start_character, end.max(start)))
 }
 
