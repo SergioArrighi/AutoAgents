@@ -6,6 +6,8 @@ This document records the manual static scan counts for `examples/rust_copilot_m
 - `[E]` = eligible for relation requests
 - `[N]` = not eligible
 
+Note: the baseline below reflects the curated static scan. The current daemon runtime in non-bulk mode can use a broader relation symbol filter (`_ => !bulk_mode`), which includes impl/object/method/enum_member symbols in addition to `fn/struct/enum/trait`.
+
 ## Symbols
 
 - `[N]` module `engine` - `lib.rs` (line 1)
@@ -260,3 +262,32 @@ Totals:
 | `examples/rust_copilot_metrics_fixture/src/types.rs` | 8 | 3 | 3 | 3 | 14 | 3 | 0 | 0 | 3 | 3 | 3 | 3 | 2 | 2 |
 | `examples/rust_copilot_metrics_fixture/src/engine.rs` | 4 | 3 | 3 | 3 | 4 | 3 | 1 | 1 | 3 | 2 | 2 | 3 | 1 | 1 |
 | `examples/rust_copilot_metrics_fixture/tests/smoke.rs` | 1 | 1 | 1 | 0 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 1 | 0 | 0 |
+
+## Current Runtime Broad Extraction (`src/types.rs`)
+
+When relation extraction runs in non-bulk mode with broad symbol eligibility, the observed/static-aligned expectation for `src/types.rs` is:
+
+- `document_symbols = 8`
+- `eligible_symbols = 8`
+- `references_requests = 8`
+- `references_nonempty = 7`
+- `references_locations = 22`
+- `implementations_requests = 8`
+- `implementations_nonempty = 3`
+- `implementations_locations = 3`
+- `definitions_requests = 8`
+- `definitions_nonempty = 8`
+- `definitions_locations = 8`
+- `type_definitions_requests = 8`
+- `type_definitions_nonempty = 1`
+- `type_definitions_locations = 1`
+
+Reference symbol mix for runtime broad mode (`src/types.rs`, `relation_kind=references`):
+
+- `PositiveRule`: 3
+- `impl crate::Rule for PositiveRule`: 3
+- `ValueState`: 9
+- `Positive`: 1
+- `Zero`: 3
+- `Negative`: 1
+- `classify`: 2
