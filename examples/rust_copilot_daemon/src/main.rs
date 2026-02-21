@@ -2342,6 +2342,10 @@ async fn extract_symbol_relations_with_lsp(
         } else if definitions.is_err() {
             metrics.definitions_failed += 1;
         }
+        eprintln!(
+            "[type-def-debug] file={} symbol={} kind={} query_pos={}:{}",
+            doc.file_path, doc.symbol, doc.kind, doc.start_line, doc.start_character
+        );
         let type_definitions = session
             .request_if_supported(
                 "textDocument/typeDefinition",
@@ -2368,12 +2372,27 @@ async fn extract_symbol_relations_with_lsp(
                 &source_lines,
             )
             .await?;
+            eprintln!(
+                "[type-def-debug] file={} symbol={} kind={} result=ok emitted={}",
+                doc.file_path, doc.symbol, doc.kind, emitted
+            );
             if emitted > 0 {
                 metrics.type_definitions_nonempty += 1;
             }
             metrics.relations_type_definitions_emitted += emitted as u64;
         } else if type_definitions.is_err() {
             metrics.type_definitions_failed += 1;
+            if let Err(err) = type_definitions {
+                eprintln!(
+                    "[type-def-debug] file={} symbol={} kind={} result=error error={:#}",
+                    doc.file_path, doc.symbol, doc.kind, err
+                );
+            }
+        } else {
+            eprintln!(
+                "[type-def-debug] file={} symbol={} kind={} result=unsupported_or_none",
+                doc.file_path, doc.symbol, doc.kind
+            );
         }
     }
 
