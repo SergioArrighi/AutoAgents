@@ -1021,6 +1021,7 @@ struct ExplainRelevanceRequest {
     limit: Option<usize>,
     vector_name: Option<String>,
     filters: Option<SearchFilters>,
+    score_threshold: Option<f64>,
 }
 
 /// Entry point: starts shared services and both communication planes.
@@ -3669,12 +3670,14 @@ pub struct Thing {
     fn explain_relevance_request_accepts_query_only_payload() {
         let req: ExplainRelevanceRequest = serde_json::from_value(json!({
             "query": "find trait impls",
-            "limit": 3
+            "limit": 3,
+            "score_threshold": 1.3
         }))
         .expect("query-only explain_relevance payload should deserialize");
 
         assert_eq!(req.query, "find trait impls");
         assert_eq!(req.limit, Some(3));
+        assert_eq!(req.score_threshold, Some(1.3));
         assert!(req.point_ids.is_none());
     }
 

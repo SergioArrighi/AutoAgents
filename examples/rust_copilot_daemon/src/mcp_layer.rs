@@ -645,6 +645,157 @@ fn relation_matches_symbol(item: &SymbolRelationDoc, query: &str) -> bool {
         || source_id.contains(&format!(":{query_leaf_lower}:"))
 }
 
+fn explain_query_terms(query: &str) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut ignored = Vec::new();
+
+    for raw in query.split_whitespace() {
+        for part in raw.split("::") {
+            for token in part.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')) {
+                if token.is_empty() {
+                    continue;
+                }
+                let normalized = token.to_lowercase();
+                if normalized.len() < 3 || is_low_signal_query_term(&normalized) {
+                    if !ignored.contains(&normalized) {
+                        ignored.push(normalized);
+                    }
+                    continue;
+                }
+                if !kept.contains(&normalized) {
+                    kept.push(normalized);
+                }
+            }
+        }
+    }
+
+    (kept, ignored)
+}
+
+fn is_low_signal_query_term(token: &str) -> bool {
+    // Keep this list short and high-confidence to avoid dropping meaningful code terms.
+    const STOPWORDS: &[&str] = &[
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "from",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "where",
+        "with",
+        "find",
+        "show",
+        "implemented",
+        "implementation",
+        "function",
+        "code",
+    ];
+    STOPWORDS.contains(&token)
+}
+
+fn compute_query_term_idf<'a>(
+    terms: &[String],
+    corpus: impl IntoIterator<Item = &'a RustItemDoc>,
+) -> HashMap<String, f64> {
+    let corpus_docs = corpus.into_iter().collect::<Vec<_>>();
+    let n = corpus_docs.len() as f64;
+    let mut idf = HashMap::new();
+
+    for term in terms {
+        let df = corpus_docs
+            .iter()
+            .filter(|doc| {
+                rust_item_search_text(doc)
+                    .to_lowercase()
+                    .contains(term.as_str())
+            })
+            .count() as f64;
+        let value = ((n + 1.0) / (df + 1.0)).ln() + 1.0;
+        idf.insert(term.clone(), value);
+    }
+
+    idf
+}
+
+fn explain_term_evidence(
+    item: &RustItemDoc,
+    terms: &[String],
+    term_idf: &HashMap<String, f64>,
+    score_threshold: f64,
+) -> (
+    Vec<String>,
+    HashMap<String, f64>,
+    HashMap<String, Vec<String>>,
+) {
+    const FIELD_WEIGHTS: [(&str, f64); 6] = [
+        ("symbol", 3.0),
+        ("symbol_path", 3.0),
+        ("signature", 2.0),
+        ("docs", 1.0),
+        ("hover_summary", 1.0),
+        ("body_excerpt", 1.0),
+    ];
+
+    let field_values = [
+        ("symbol", item.symbol.to_lowercase()),
+        ("symbol_path", item.symbol_path.to_lowercase()),
+        ("signature", item.signature.to_lowercase()),
+        ("docs", item.docs.to_lowercase()),
+        ("hover_summary", item.hover_summary.to_lowercase()),
+        ("body_excerpt", item.body_excerpt.to_lowercase()),
+    ];
+
+    let mut term_scores: HashMap<String, f64> = HashMap::new();
+    let mut evidence_fields: HashMap<String, Vec<String>> = HashMap::new();
+
+    for term in terms {
+        let idf = term_idf.get(term).copied().unwrap_or(1.0);
+        for (field_name, field_weight) in FIELD_WEIGHTS {
+            if let Some((_, value)) = field_values.iter().find(|(name, _)| *name == field_name)
+                && value.contains(term.as_str())
+            {
+                *term_scores.entry(term.clone()).or_insert(0.0) += field_weight * idf;
+                let fields = evidence_fields.entry(term.clone()).or_default();
+                if !fields.iter().any(|f| f == field_name) {
+                    fields.push(field_name.to_string());
+                }
+            }
+        }
+    }
+
+    let mut ranked = term_scores
+        .iter()
+        .filter(|(_, score)| **score >= score_threshold)
+        .map(|(term, score)| (term.clone(), *score))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    let matched_terms = ranked
+        .iter()
+        .map(|(term, _)| term.clone())
+        .collect::<Vec<_>>();
+    let matched_term_scores = ranked.into_iter().collect::<HashMap<_, _>>();
+
+    (matched_terms, matched_term_scores, evidence_fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +833,71 @@ mod tests {
         assert!(relation_matches_symbol(&value_state, "types::ValueState"));
         assert!(!relation_matches_symbol(&run_default, "ValueState"));
     }
+
+    #[test]
+    fn explain_query_terms_filters_low_signal_words() {
+        let (kept, ignored) = explain_query_terms("where is Rule implemented in the engine?");
+
+        assert!(kept.contains(&"rule".to_string()));
+        assert!(kept.contains(&"engine".to_string()));
+        assert!(!kept.contains(&"where".to_string()));
+        assert!(!kept.contains(&"implemented".to_string()));
+        assert!(ignored.contains(&"where".to_string()));
+        assert!(ignored.contains(&"implemented".to_string()));
+    }
+
+    #[test]
+    fn explain_query_terms_keeps_code_identifiers() {
+        let (kept, _ignored) = explain_query_terms("impl crate::Rule for PositiveRule");
+
+        assert!(kept.contains(&"impl".to_string()));
+        assert!(kept.contains(&"crate".to_string()));
+        assert!(kept.contains(&"rule".to_string()));
+        assert!(kept.contains(&"positiverule".to_string()));
+    }
+
+    fn sample_doc(id: &str, symbol: &str, signature: &str, body_excerpt: &str) -> RustItemDoc {
+        RustItemDoc {
+            id: id.to_string(),
+            kind: "fn".to_string(),
+            symbol: symbol.to_string(),
+            file_path: "src/lib.rs".to_string(),
+            workspace_id: "ws_test".to_string(),
+            uri: "file:///tmp/ws/src/lib.rs".to_string(),
+            module: "src::lib".to_string(),
+            symbol_path: format!("src::lib::{symbol}"),
+            crate_name: "fixture".to_string(),
+            edition: "2021".to_string(),
+            signature: signature.to_string(),
+            docs: String::new(),
+            hover_summary: String::new(),
+            body_excerpt: body_excerpt.to_string(),
+            start_line: 1,
+            start_character: 0,
+            end_line: 1,
+        }
+    }
+
+    #[test]
+    fn explain_term_evidence_applies_threshold_and_ranking() {
+        let doc = sample_doc(
+            "symbol:ws_test:src/lib.rs:fn:run:1:1",
+            "run",
+            "pub fn run(rule: &dyn Rule) -> bool {",
+            "evaluate_pair(rule, left, right)",
+        );
+        let terms = vec!["rule".to_string(), "engine".to_string()];
+        let mut idf = HashMap::new();
+        idf.insert("rule".to_string(), 1.2);
+        idf.insert("engine".to_string(), 2.0);
+
+        let (matched, scores, fields) = explain_term_evidence(&doc, &terms, &idf, 2.0);
+
+        assert_eq!(matched, vec!["rule".to_string()]);
+        assert!(scores.get("rule").copied().unwrap_or_default() >= 2.0);
+        assert!(fields.contains_key("rule"));
+        assert!(!fields.contains_key("engine"));
+    }
 }
 
 /// Implements `explain_relevance` tool.
@@ -690,6 +906,7 @@ async fn handle_mcp_explain_relevance(
     req: ExplainRelevanceRequest,
 ) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, None, 5);
+    let score_threshold = req.score_threshold.unwrap_or(1.2).max(0.0);
     let vector_name = req
         .vector_name
         .clone()
@@ -762,12 +979,7 @@ async fn handle_mcp_explain_relevance(
         };
 
     let state = app.state.read().await;
-    let query_tokens = req
-        .query
-        .to_lowercase()
-        .split_whitespace()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>();
+    let (query_terms, ignored_terms) = explain_query_terms(&req.query);
 
     let mut items_by_id = HashMap::new();
     for items in state.rust_items_by_file.values() {
@@ -775,17 +987,18 @@ async fn handle_mcp_explain_relevance(
             items_by_id.insert(item.id.clone(), item.clone());
         }
     }
+    let corpus = items_by_id
+        .values()
+        .filter(|item| matches_filters(item, req.filters.as_ref(), &default_workspace_id))
+        .collect::<Vec<_>>();
+    let term_idf = compute_query_term_idf(&query_terms, corpus);
 
     let mut explanations = Vec::new();
 
     for point_id in &resolved_point_ids {
         if let Some(item) = items_by_id.get(point_id) {
-            let lower = rust_item_search_text(&item).to_lowercase();
-            let matched = query_tokens
-                .iter()
-                .filter(|token| lower.contains(token.as_str()))
-                .cloned()
-                .collect::<Vec<_>>();
+            let (matched, matched_term_scores, evidence_fields) =
+                explain_term_evidence(item, &query_terms, &term_idf, score_threshold);
 
             explanations.push(json!({
                 "point_id": item.id,
@@ -793,6 +1006,9 @@ async fn handle_mcp_explain_relevance(
                 "item": item,
                 "score": candidate_scores.get(&item.id).copied(),
                 "matched_terms": matched,
+                "matched_term_scores": matched_term_scores,
+                "evidence_fields": evidence_fields,
+                "ignored_query_terms": ignored_terms.clone(),
                 "reason": "Item matched lexical terms and/or semantic embedding neighborhood.",
             }));
         }
@@ -802,6 +1018,7 @@ async fn handle_mcp_explain_relevance(
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
         "semantic_vector_name": vector_name,
+        "score_threshold": score_threshold,
         "resolved_point_ids": resolved_point_ids,
         "explanation": explanations,
     }))
