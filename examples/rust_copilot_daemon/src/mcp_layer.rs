@@ -187,7 +187,7 @@ async fn handle_mcp_workspace_metadata(app: App) -> Result<Value, RpcError> {
 
 /// Implements `search_code` using lexical + semantic hybrid ranking.
 async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Value, RpcError> {
-    let top_k = req.top_k.unwrap_or(8).max(1);
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
     let vector_name = req
         .vector_name
         .clone()
@@ -267,7 +267,7 @@ async fn handle_mcp_search_relations(
     app: App,
     req: SearchRelationsRequest,
 ) -> Result<Value, RpcError> {
-    let top_k = req.top_k.unwrap_or(8).max(1);
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
     let vector_name = req
         .vector_name
         .clone()
@@ -354,6 +354,10 @@ pub(super) fn lexical_search(
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(top_k);
     scored
+}
+
+fn resolve_limit(limit: Option<usize>, top_k: Option<usize>, default: usize) -> usize {
+    limit.or(top_k).unwrap_or(default).max(1)
 }
 
 /// Applies optional search filters to a chunk.
@@ -448,6 +452,7 @@ async fn handle_mcp_get_symbol_context(
     req: SymbolContextRequest,
 ) -> Result<Value, RpcError> {
     let needle = req.symbol.to_lowercase();
+    let limit = req.limit.unwrap_or(8).max(1);
     let state = app.state.read().await;
     let mut locations = Vec::new();
 
@@ -471,6 +476,50 @@ async fn handle_mcp_get_symbol_context(
         }
     }
 
+    locations.sort_by(|a, b| {
+        let a_file = a
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let b_file = b
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let a_start = a
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let b_start = b
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let a_end = a
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let b_end = b
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let a_id = a
+            .get("item")
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let b_id = b
+            .get("item")
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        a_file
+            .cmp(b_file)
+            .then(a_start.cmp(&b_start))
+            .then(a_end.cmp(&b_end))
+            .then(a_id.cmp(b_id))
+    });
+    locations.truncate(limit);
+
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
@@ -483,7 +532,7 @@ async fn handle_mcp_get_symbol_relations(
     app: App,
     req: SymbolRelationsRequest,
 ) -> Result<Value, RpcError> {
-    let needle = req.symbol.to_lowercase();
+    let limit = req.limit.unwrap_or(8).max(1);
     let relation_kind = req.relation_kind.as_deref();
     let state = app.state.read().await;
     let mut relations = Vec::new();
@@ -501,8 +550,7 @@ async fn handle_mcp_get_symbol_relations(
             {
                 continue;
             }
-            let search_text = relation_search_text(item).to_lowercase();
-            if search_text.contains(&needle) {
+            if relation_matches_symbol(item, &req.symbol) {
                 relations.push(json!({
                     "file_path": file_path,
                     "item": item,
@@ -511,11 +559,129 @@ async fn handle_mcp_get_symbol_relations(
         }
     }
 
+    relations.sort_by(|a, b| {
+        let a_file = a
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let b_file = b
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let a_target_file = a
+            .get("item")
+            .and_then(|item| item.get("target_file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let b_target_file = b
+            .get("item")
+            .and_then(|item| item.get("target_file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let a_start = a
+            .get("item")
+            .and_then(|item| item.get("target_start_line"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let b_start = b
+            .get("item")
+            .and_then(|item| item.get("target_start_line"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let a_end = a
+            .get("item")
+            .and_then(|item| item.get("target_end_line"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let b_end = b
+            .get("item")
+            .and_then(|item| item.get("target_end_line"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let a_id = a
+            .get("item")
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let b_id = b
+            .get("item")
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        a_file
+            .cmp(b_file)
+            .then(a_target_file.cmp(b_target_file))
+            .then(a_start.cmp(&b_start))
+            .then(a_end.cmp(&b_end))
+            .then(a_id.cmp(b_id))
+    });
+    relations.truncate(limit);
+
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
         "relations": relations,
     }))
+}
+
+fn relation_matches_symbol(item: &SymbolRelationDoc, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return false;
+    }
+
+    let query_leaf = query.rsplit("::").next().unwrap_or(query).trim();
+    if item.source_symbol.eq_ignore_ascii_case(query)
+        || item.source_symbol.eq_ignore_ascii_case(query_leaf)
+    {
+        return true;
+    }
+
+    let source_id = item.source_symbol_id.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let query_leaf_lower = query_leaf.to_lowercase();
+    source_id.contains(&format!(":{query_lower}:"))
+        || source_id.contains(&format!(":{query_leaf_lower}:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relation_doc(source_symbol: &str, source_symbol_id: &str) -> SymbolRelationDoc {
+        SymbolRelationDoc {
+            id: "relation:test".to_string(),
+            workspace_id: "ws_test".to_string(),
+            relation_kind: "references".to_string(),
+            source_symbol_id: source_symbol_id.to_string(),
+            source_symbol: source_symbol.to_string(),
+            source_file_path: "src/lib.rs".to_string(),
+            source_crate_name: "fixture".to_string(),
+            source_uri: "file:///tmp/src/lib.rs".to_string(),
+            target_file_path: "src/lib.rs".to_string(),
+            target_uri: "file:///tmp/src/lib.rs".to_string(),
+            target_start_line: 1,
+            target_end_line: 1,
+            target_excerpt: "pub enum ValueState {}".to_string(),
+        }
+    }
+
+    #[test]
+    fn relation_matches_symbol_requires_source_identity() {
+        let value_state = relation_doc(
+            "ValueState",
+            "relation:ws_test:references:symbol:ws_test:src/types.rs:enum:ValueState:8:12:src/lib.rs:1:1",
+        );
+        let run_default = relation_doc(
+            "run_default",
+            "relation:ws_test:references:symbol:ws_test:src/engine.rs:fn:run_default:11:19:src/lib.rs:1:1",
+        );
+
+        assert!(relation_matches_symbol(&value_state, "ValueState"));
+        assert!(relation_matches_symbol(&value_state, "types::ValueState"));
+        assert!(!relation_matches_symbol(&run_default, "ValueState"));
+    }
 }
 
 /// Implements `explain_relevance` tool.

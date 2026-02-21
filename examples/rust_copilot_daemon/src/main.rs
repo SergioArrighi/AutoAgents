@@ -957,6 +957,7 @@ struct WorkspaceRenamedParams {
 #[derive(Debug, Deserialize)]
 struct SearchCodeRequest {
     query: String,
+    limit: Option<usize>,
     top_k: Option<usize>,
     vector_name: Option<String>,
     filters: Option<SearchFilters>,
@@ -989,6 +990,7 @@ struct GetFileChunksRequest {
 #[derive(Debug, Deserialize)]
 struct SymbolContextRequest {
     symbol: String,
+    limit: Option<usize>,
     file_path: Option<String>,
 }
 
@@ -996,6 +998,7 @@ struct SymbolContextRequest {
 #[derive(Debug, Deserialize)]
 struct SymbolRelationsRequest {
     symbol: String,
+    limit: Option<usize>,
     relation_kind: Option<String>,
     file_path: Option<String>,
 }
@@ -1004,6 +1007,7 @@ struct SymbolRelationsRequest {
 #[derive(Debug, Deserialize)]
 struct SearchRelationsRequest {
     query: String,
+    limit: Option<usize>,
     top_k: Option<usize>,
     vector_name: Option<String>,
     filters: Option<RelationSearchFilters>,
@@ -2678,7 +2682,7 @@ fn lsp_hover_to_text(result: &Value) -> Option<String> {
     lsp_marked_content_to_text(contents)
 }
 
-/* 
+/*
 fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
     let signatures = result.get("signatures")?.as_array()?;
     let first = signatures.first()?;
