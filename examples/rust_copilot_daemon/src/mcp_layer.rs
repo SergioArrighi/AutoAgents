@@ -826,7 +826,7 @@ mod tests {
         );
         let run_default = relation_doc(
             "run_default",
-            "relation:ws_test:references:symbol:ws_test:src/engine.rs:fn:run_default:11:19:src/lib.rs:1:1",
+            "relation:ws_test:references:symbol:ws_test:src/engine.rs:fn:run_default:12:20:src/lib.rs:1:1",
         );
 
         assert!(relation_matches_symbol(&value_state, "ValueState"));

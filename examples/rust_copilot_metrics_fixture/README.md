@@ -7,9 +7,22 @@ This fixture includes real Rust symbols and cross-file references:
 - struct + enum
 - top-level functions with symbol usage across modules
 
+## Source layout
+
+- `src/lib.rs`: shared trait (`Rule`) and evaluation helpers.
+- `src/types.rs`: rule implementation (`PositiveRule`) and value classification.
+- `src/engine.rs`: fixture orchestration (`Engine`, `run_default`).
+- `tests/smoke.rs`: minimal behavioral assertion used as a stability check.
+
 Expected metrics are in:
 - `examples/rust_copilot_daemon/eval/fixtures/rust_copilot_metrics_fixture.expected.json`
 - Rust-analyzer source baseline: `examples/rust_copilot_daemon/eval/fixtures/rust_copilot_metrics_fixture.rust_analyzer_baseline.json`
+
+## Local verification
+
+Run fixture tests:
+
+`cargo test -p rust-copilot-metrics-fixture`
 
 ## Validation flow
 

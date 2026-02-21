@@ -53,6 +53,8 @@ struct RuntimeConfig {
     qdrant_collection: String,
     /// Qdrant collection name for cross-file symbol relations.
     qdrant_relation_collection: String,
+    /// Qdrant collection name for workspace crate metadata.
+    qdrant_metadata_collection: String,
     /// Optional Qdrant API key.
     qdrant_api_key: Option<String>,
     /// Ollama endpoint URL.
@@ -78,6 +80,8 @@ impl Default for RuntimeConfig {
                 .unwrap_or_else(|_| "rust_copilot_chunks".to_string()),
             qdrant_relation_collection: std::env::var("QDRANT_RELATION_COLLECTION")
                 .unwrap_or_else(|_| "rust_copilot_relations".to_string()),
+            qdrant_metadata_collection: std::env::var("QDRANT_METADATA_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_metadata".to_string()),
             qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
@@ -414,6 +418,8 @@ struct Services {
     store: QdrantVectorStore,
     /// Dedicated vector store for relation documents.
     relation_store: QdrantVectorStore,
+    /// Dedicated vector store for workspace metadata documents.
+    metadata_store: QdrantVectorStore,
 }
 
 /// Root application context injected into all tasks and handlers.
@@ -1089,6 +1095,11 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
         .model(&config.embedding_model)
         .build()
         .context("failed to build relation embedding client")?;
+    let metadata_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build metadata embedding client")?;
 
     let store = if let Some(api_key) = &config.qdrant_api_key {
         QdrantVectorStore::with_api_key(
@@ -1122,9 +1133,26 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
     }
     .context("failed to initialize relation Qdrant store")?;
 
+    let metadata_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            metadata_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_metadata_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            metadata_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_metadata_collection.clone(),
+        )
+    }
+    .context("failed to initialize metadata Qdrant store")?;
+
     Ok(Services {
         store,
         relation_store,
+        metadata_store,
     })
 }
 
@@ -2009,7 +2037,7 @@ async fn refresh_workspace_metadata(app: &App) -> Result<()> {
         app.services
             .read()
             .await
-            .store
+            .metadata_store
             .delete_documents_by_ids(&stale_ids)
             .await
             .context("qdrant metadata stale delete failed")?;
@@ -2027,7 +2055,7 @@ async fn refresh_workspace_metadata(app: &App) -> Result<()> {
         app.services
             .read()
             .await
-            .store
+            .metadata_store
             .insert_documents_with_named_vectors(rows)
             .await
             .context("qdrant metadata upsert failed")?;
@@ -2175,7 +2203,7 @@ async fn extract_symbol_relations_with_lsp(
             doc.symbol, doc.kind, doc.start_line, doc.start_character
         );
         let position = json!({
-            "line": doc.start_line,
+            "line": doc.start_line.saturating_sub(1),
             "character": doc.start_character
         });
         let definition_probe = session
@@ -2469,6 +2497,9 @@ async fn append_relation_targets(
             )
             .await
         };
+        if relation_target_is_low_signal(&excerpt) {
+            continue;
+        }
 
         let id = format!(
             "relation:{workspace_id}:{kind}:{source}:{target}:{start}:{end}",
@@ -2497,6 +2528,25 @@ async fn append_relation_targets(
         emitted += 1;
     }
     Ok(emitted)
+}
+
+fn relation_target_is_low_signal(excerpt: &str) -> bool {
+    let Some(first) = excerpt.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) else {
+        return false;
+    };
+
+    first.starts_with("use ")
+        || first.starts_with("pub use ")
+        || first.starts_with("mod ")
+        || first.starts_with("pub mod ")
+        || first.starts_with("extern crate ")
 }
 
 #[derive(Debug)]
@@ -2595,8 +2645,7 @@ async fn enrich_docs_with_lsp_metadata(
 ) -> Result<()> {
     for doc in docs {
         let position = json!({
-            //"line": doc.start_line.saturating_sub(1),
-            "line": doc.start_line,
+            "line": doc.start_line.saturating_sub(1),
             "character": doc.start_character
         });
 
@@ -2998,23 +3047,12 @@ fn collect_lsp_symbol_docs(
         .to_string();
 
     if let Some((start_line, start_character, end_line)) = lsp_symbol_position_range(item) {
-        //let (resolved_start_line, resolved_start_character) =
-        //    symbol_position_in_lsp_range(lines, name, start_line, end_line)
-        //        .unwrap_or((start_line, start_character));
-        //let sig_idx = resolved_start_line.saturating_sub(1);
-        //let signature_line = lines.get(sig_idx).copied().unwrap_or("");
-        let signature_line = lines.get(start_line).copied().unwrap_or("");
-        //let resolved_start_character = if resolved_start_character == 0 {
-        //    symbol_start_character(signature_line, name)
-        //} else {
-        //    resolved_start_character
-        //};
-
+        let start_idx = start_line.saturating_sub(1);
+        let end_idx = end_line.saturating_sub(1);
+        let signature_line = lines.get(start_idx).copied().unwrap_or("");
         let signature = signature_line.trim().to_string();
-        //let docs = collect_docs_above(lines, sig_idx);
-        let docs = collect_docs_above(lines, start_line);
-        //let excerpt = excerpt_from_range(lines, sig_idx, end_line.saturating_sub(1), 60);
-        let excerpt = excerpt_from_range(lines, start_line, end_line, 60);
+        let docs = collect_docs_above(lines, start_idx);
+        let excerpt = excerpt_from_range(lines, start_idx, end_idx, 60);
         let id = format!("symbol:{workspace_id}:{file_path}:{kind}:{name}:{start_line}:{end_line}");
 
         out.push(RustItemDoc {
@@ -3033,9 +3071,7 @@ fn collect_lsp_symbol_docs(
             hover_summary: String::new(),
             // signature_help: String::new(),
             body_excerpt: excerpt,
-            //start_line: resolved_start_line,
             start_line,
-            //start_character: resolved_start_character,
             start_character,
             end_line,
         });
@@ -3068,8 +3104,8 @@ fn lsp_symbol_position_range(item: &Value) -> Option<(usize, usize, usize)> {
                 .and_then(|start| start.get("line"))
                 .and_then(Value::as_u64)
         })
-        .unwrap_or(0) as usize;
-    //+ 1;
+        .unwrap_or(0) as usize
+        + 1;
     let start_character = selection_range
         .and_then(|sel| sel.get("start"))
         .and_then(|start| start.get("character"))
@@ -3081,7 +3117,7 @@ fn lsp_symbol_position_range(item: &Value) -> Option<(usize, usize, usize)> {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0) as usize;
-    let end = range.get("end")?.get("line")?.as_u64()? as usize; // + 1;
+    let end = range.get("end")?.get("line")?.as_u64()? as usize + 1;
     Some((start, start_character, end.max(start)))
 }
 
@@ -3599,6 +3635,57 @@ pub struct Thing {
     }
 
     #[test]
+    fn parse_lsp_symbols_uses_one_based_line_numbers() {
+        let src = include_str!("../../rust_copilot_metrics_fixture/src/engine.rs");
+        let symbols = json!([
+            {
+                "name": "Engine",
+                "kind": 23,
+                "range": {
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 9, "character": 1 }
+                },
+                "selectionRange": {
+                    "start": { "line": 3, "character": 11 },
+                    "end": { "line": 3, "character": 17 }
+                }
+            },
+            {
+                "name": "run_default",
+                "kind": 12,
+                "range": {
+                    "start": { "line": 11, "character": 0 },
+                    "end": { "line": 19, "character": 1 }
+                },
+                "selectionRange": {
+                    "start": { "line": 11, "character": 7 },
+                    "end": { "line": 11, "character": 18 }
+                }
+            }
+        ]);
+
+        let docs = parse_lsp_symbols(
+            symbols,
+            "ws_test",
+            "src/engine.rs",
+            "file:///tmp/ws/src/engine.rs",
+            src,
+        );
+
+        let engine = docs
+            .iter()
+            .find(|doc| doc.symbol == "Engine")
+            .expect("Engine symbol should be indexed");
+        assert_eq!(engine.start_line, 4);
+
+        let run_default = docs
+            .iter()
+            .find(|doc| doc.symbol == "run_default")
+            .expect("run_default symbol should be indexed");
+        assert_eq!(run_default.start_line, 12);
+    }
+
+    #[test]
     fn symbol_docs_to_chunks_uses_stable_symbol_ids() {
         let docs = vec![RustItemDoc {
             id: "symbol:ws_test:src/lib.rs:fn:add:1:3".to_string(),
@@ -3701,5 +3788,24 @@ pub struct Thing {
         maybe_upgrade_symbol_path(&mut doc, "evaluate");
 
         assert_eq!(doc.symbol_path, "src::lib::evaluate");
+    }
+
+    #[test]
+    fn relation_target_is_low_signal_for_import_and_module_lines() {
+        assert!(relation_target_is_low_signal("use crate::types::ValueState;"));
+        assert!(relation_target_is_low_signal("pub use crate::engine::run_default;"));
+        assert!(relation_target_is_low_signal("mod engine;"));
+        assert!(relation_target_is_low_signal("pub mod engine;"));
+        assert!(relation_target_is_low_signal("extern crate alloc;"));
+    }
+
+    #[test]
+    fn relation_target_is_not_low_signal_for_real_code_targets() {
+        assert!(!relation_target_is_low_signal(
+            "pub fn run_default(left: i32, right: i32) -> ValueState {"
+        ));
+        assert!(!relation_target_is_low_signal(
+            "impl Engine {\n    pub fn run(...) -> bool {"
+        ));
     }
 }
