@@ -2342,57 +2342,59 @@ async fn extract_symbol_relations_with_lsp(
         } else if definitions.is_err() {
             metrics.definitions_failed += 1;
         }
-        eprintln!(
-            "[type-def-debug] file={} symbol={} kind={} query_pos={}:{}",
-            doc.file_path, doc.symbol, doc.kind, doc.start_line, doc.start_character
-        );
-        let type_definitions = session
-            .request_if_supported(
-                "textDocument/typeDefinition",
-                json!({
-                    "textDocument": { "uri": file_uri },
-                    "position": position
-                }),
-                LSP_HEAVY_REQUEST_TIMEOUT,
-                LSP_CONTENT_MODIFIED_RETRIES,
-            )
-            .await;
-        if let Ok(Some(type_definitions)) = type_definitions {
-            metrics.type_definitions_success += 1;
-            let emitted = append_relation_targets(
-                &mut out,
-                &mut seen,
-                &mut cache,
-                workspace_root,
-                workspace_id,
-                file_path_rel,
-                doc,
-                "type_definitions",
-                type_definitions,
-                &source_lines,
-            )
-            .await?;
+        if should_request_type_definitions_for_symbol(doc) {
             eprintln!(
-                "[type-def-debug] file={} symbol={} kind={} result=ok emitted={}",
-                doc.file_path, doc.symbol, doc.kind, emitted
+                "[type-def-debug] file={} symbol={} kind={} query_pos={}:{}",
+                doc.file_path, doc.symbol, doc.kind, doc.start_line, doc.start_character
             );
-            if emitted > 0 {
-                metrics.type_definitions_nonempty += 1;
-            }
-            metrics.relations_type_definitions_emitted += emitted as u64;
-        } else if type_definitions.is_err() {
-            metrics.type_definitions_failed += 1;
-            if let Err(err) = type_definitions {
+            let type_definitions = session
+                .request_if_supported(
+                    "textDocument/typeDefinition",
+                    json!({
+                        "textDocument": { "uri": file_uri },
+                        "position": position
+                    }),
+                    LSP_HEAVY_REQUEST_TIMEOUT,
+                    LSP_CONTENT_MODIFIED_RETRIES,
+                )
+                .await;
+            if let Ok(Some(type_definitions)) = type_definitions {
+                metrics.type_definitions_success += 1;
+                let emitted = append_relation_targets(
+                    &mut out,
+                    &mut seen,
+                    &mut cache,
+                    workspace_root,
+                    workspace_id,
+                    file_path_rel,
+                    doc,
+                    "type_definitions",
+                    type_definitions,
+                    &source_lines,
+                )
+                .await?;
                 eprintln!(
-                    "[type-def-debug] file={} symbol={} kind={} result=error error={:#}",
-                    doc.file_path, doc.symbol, doc.kind, err
+                    "[type-def-debug] file={} symbol={} kind={} result=ok emitted={}",
+                    doc.file_path, doc.symbol, doc.kind, emitted
+                );
+                if emitted > 0 {
+                    metrics.type_definitions_nonempty += 1;
+                }
+                metrics.relations_type_definitions_emitted += emitted as u64;
+            } else if type_definitions.is_err() {
+                metrics.type_definitions_failed += 1;
+                if let Err(err) = type_definitions {
+                    eprintln!(
+                        "[type-def-debug] file={} symbol={} kind={} result=error error={:#}",
+                        doc.file_path, doc.symbol, doc.kind, err
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[type-def-debug] file={} symbol={} kind={} result=unsupported_or_none",
+                    doc.file_path, doc.symbol, doc.kind
                 );
             }
-        } else {
-            eprintln!(
-                "[type-def-debug] file={} symbol={} kind={} result=unsupported_or_none",
-                doc.file_path, doc.symbol, doc.kind
-            );
         }
     }
 
@@ -2723,6 +2725,10 @@ fn should_extract_relations_for_symbol(doc: &RustItemDoc, bulk_mode: bool) -> bo
 
 fn should_request_implementations_for_symbol(doc: &RustItemDoc) -> bool {
     matches!(doc.kind.as_str(), "trait" | "struct" | "method")
+}
+
+fn should_request_type_definitions_for_symbol(doc: &RustItemDoc) -> bool {
+    matches!(doc.kind.as_str(), "trait" | "struct" | "enum")
 }
 
 fn lsp_hover_to_text(result: &Value) -> Option<String> {
