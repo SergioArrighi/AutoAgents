@@ -159,6 +159,11 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         *app.services.write().await = rebuilt;
     }
 
+    {
+        let mut state = app.state.write().await;
+        state.is_ra_warm = false;
+    }
+
     if workspace_changed {
         let mut state = app.state.write().await;
         state.rust_items_by_file.clear();
@@ -170,6 +175,7 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         state.metadata_docs_by_crate.clear();
         state.indexed_metadata_ids.clear();
         state.extraction_metrics = ExtractionMetrics::default();
+        state.is_ra_warm = false;
         state.queue_depth = 0;
         state.indexing_in_progress = false;
         state.last_error = None;

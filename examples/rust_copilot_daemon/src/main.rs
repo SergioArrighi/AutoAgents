@@ -161,7 +161,7 @@ struct RustItemDoc {
     /// Hover payload extracted from rust-analyzer.
     hover_summary: String,
     // /// Signature help summary extracted from rust-analyzer.
-    signature_help: String,
+    // signature_help: String,
     /// Short source excerpt for additional context.
     body_excerpt: String,
     /// Inclusive start line (1-based).
@@ -323,8 +323,8 @@ struct FileExtractionMetrics {
     workspace_symbol_success: u64,
     workspace_symbol_failed: u64,
     workspace_symbol_nonempty: u64,
-    signature_help_success: u64,
-    signature_help_failed: u64,
+    // signature_help_success: u64,
+    // signature_help_failed: u64,
     references_success: u64,
     references_failed: u64,
     references_nonempty: u64,
@@ -374,6 +374,8 @@ struct State {
     indexed_metadata_ids: HashSet<String>,
     /// Aggregated extraction metrics.
     extraction_metrics: ExtractionMetrics,
+    /// True after a post-initialize warm-up extraction has completed.
+    is_ra_warm: bool,
 }
 
 impl State {
@@ -805,13 +807,13 @@ impl RaLspSession {
 
     async fn wait_for_work_done_settle(&mut self, timeout: Duration) -> Result<()> {
         if !self.saw_work_done_progress {
-            eprintln!("work-done settle skipped: no $/progress notifications observed yet");
+            // eprintln!("work-done settle skipped: no $/progress notifications observed yet");
             return Ok(());
         }
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             if self.work_done_in_flight == 0 {
-                eprintln!("work-done settled: in_flight=0");
+                // eprintln!("work-done settled: in_flight=0");
                 return Ok(());
             }
             match tokio::time::timeout(
@@ -1384,6 +1386,36 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         apply_crate_metadata_to_relation_docs(&mut relation_docs, crate_meta);
     }
 
+    let should_discard_for_warmup = {
+        let state = app.state.read().await;
+        !state.is_ra_warm
+    };
+    if should_discard_for_warmup {
+        let requeue_needed = {
+            let mut state = app.state.write().await;
+            if state.is_ra_warm {
+                false
+            } else {
+                state.is_ra_warm = true;
+                state.queue_depth = state.queue_depth.saturating_add(1);
+                true
+            }
+        };
+
+        if requeue_needed {
+            eprintln!(
+                "rust-analyzer warm-up complete; discarding first pass and requeueing {}",
+                file_rel
+            );
+            app.dirty_tx
+                .send(DirtyEvent::Index(path.to_path_buf()))
+                .await
+                .map_err(|_| anyhow::anyhow!("index queue unavailable during warm-up requeue"))?;
+        }
+
+        return Ok(());
+    }
+
     let symbol_rows = final_docs
         .iter()
         .map(|doc| NamedVectorDocument {
@@ -1581,7 +1613,7 @@ fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<RustItemDoc> {
                 .to_string(),
             docs: String::new(),
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt: chunk.text.clone(),
             start_line: chunk.start_line,
             start_character: 0,
@@ -1758,11 +1790,12 @@ fn derive_workspace_id(workspace_root: &Path) -> String {
 
 fn rust_item_search_text(doc: &RustItemDoc) -> String {
     format!(
-        "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        // "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        "{symbol}\n{symbol_path}\n{signature}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
         symbol = doc.symbol,
         symbol_path = doc.symbol_path,
         signature = doc.signature,
-        signature_help = doc.signature_help,
+        // signature_help = doc.signature_help,
         docs = doc.docs,
         hover_summary = doc.hover_summary,
         body_excerpt = doc.body_excerpt,
@@ -1804,9 +1837,10 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
         (
             SIGNATURE_VECTOR_NAME.to_string(),
             format!(
-                "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                // "{signature}\n{signature_help}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
+                "{signature}\nsymbol: {symbol}\nkind: {kind}\nmodule: {module}\npath: {file_path}\nworkspace_id: {workspace_id}",
                 signature = doc.signature,
-                signature_help = doc.signature_help,
+                //signature_help = doc.signature_help,
                 symbol = doc.symbol,
                 kind = doc.kind,
                 module = doc.module,
@@ -2644,6 +2678,7 @@ fn lsp_hover_to_text(result: &Value) -> Option<String> {
     lsp_marked_content_to_text(contents)
 }
 
+/* 
 fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
     let signatures = result.get("signatures")?.as_array()?;
     let first = signatures.first()?;
@@ -2651,7 +2686,7 @@ fn lsp_signature_help_to_text(result: &Value) -> Option<String> {
         .get("label")
         .and_then(Value::as_str)
         .map(|v| v.trim().to_string())
-}
+}*/
 
 fn lsp_workspace_symbol_path_for_item(
     result: &Value,
@@ -2804,16 +2839,16 @@ fn update_work_done_progress_state(msg: &Value, in_flight: &mut usize, saw_progr
         Some("begin") => {
             *saw_progress = true;
             *in_flight = in_flight.saturating_add(1);
-            eprintln!("work-done progress begin: in_flight={}", *in_flight);
+            // eprintln!("work-done progress begin: in_flight={}", *in_flight);
         }
         Some("end") => {
             *saw_progress = true;
             *in_flight = in_flight.saturating_sub(1);
-            eprintln!("work-done progress end: in_flight={}", *in_flight);
+            // eprintln!("work-done progress end: in_flight={}", *in_flight);
         }
         Some("report") => {
             *saw_progress = true;
-            eprintln!("work-done progress report: in_flight={}", *in_flight);
+            // eprintln!("work-done progress report: in_flight={}", *in_flight);
         }
         _ => {}
     }
@@ -2939,7 +2974,7 @@ fn collect_lsp_symbol_docs(
             signature,
             docs,
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt: excerpt,
             //start_line: resolved_start_line,
             start_line,
@@ -3070,7 +3105,7 @@ fn extract_symbol_docs_heuristic(
             signature,
             docs: item_docs,
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt,
             start_line,
             start_character: symbol_start_character(lines[line_idx], &symbol),
@@ -3391,7 +3426,7 @@ mod tests {
             signature: format!("fn {symbol}() {{}}"),
             docs: String::new(),
             hover_summary: String::new(),
-            signature_help: String::new(),
+            // signature_help: String::new(),
             body_excerpt: excerpt.to_string(),
             start_line: 1,
             start_character: 0,
@@ -3550,7 +3585,7 @@ pub struct Thing {
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
-            signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
+            // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             start_character: 3,

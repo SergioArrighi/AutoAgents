@@ -167,8 +167,12 @@ impl QdrantVectorStore {
     {
         if let Some(raw) = payload.get("raw") {
             let value = serde_json::to_value(raw).map_err(VectorStoreError::JsonError)?;
-            let parsed = serde_json::from_value(value)?;
-            Ok(Some(parsed))
+            match serde_json::from_value(value) {
+                Ok(parsed) => Ok(Some(parsed)),
+                // Mixed-shape collections are valid (e.g. symbol docs + metadata docs).
+                // Treat non-matching payloads as non-results for the requested type.
+                Err(_) => Ok(None),
+            }
         } else {
             Ok(None)
         }

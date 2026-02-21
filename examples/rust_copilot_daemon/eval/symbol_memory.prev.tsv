@@ -1,0 +1,8 @@
+src/types.rs	PositiveRule	struct	0	0	symbol:ws_87fc98f865a32cd9:src/types.rs:struct:PositiveRule:0:0
+src/types.rs	impl crate::Rule for PositiveRule	object	2	6	symbol:ws_87fc98f865a32cd9:src/types.rs:object:impl crate::Rule for PositiveRule:2:6
+src/types.rs	allows	method	3	5	symbol:ws_87fc98f865a32cd9:src/types.rs:method:allows:3:5
+src/types.rs	ValueState	enum	8	12	symbol:ws_87fc98f865a32cd9:src/types.rs:enum:ValueState:8:12
+src/types.rs	Positive	enum_member	9	9	symbol:ws_87fc98f865a32cd9:src/types.rs:enum_member:Positive:9:9
+src/types.rs	Zero	enum_member	10	10	symbol:ws_87fc98f865a32cd9:src/types.rs:enum_member:Zero:10:10
+src/types.rs	Negative	enum_member	11	11	symbol:ws_87fc98f865a32cd9:src/types.rs:enum_member:Negative:11:11
+src/types.rs	classify	fn	14	22	symbol:ws_87fc98f865a32cd9:src/types.rs:fn:classify:14:22
