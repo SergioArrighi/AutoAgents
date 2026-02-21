@@ -28,10 +28,7 @@ pub(super) async fn run_jsonrpc_stdio(app: App, mut stop_rx: watch::Receiver<boo
 
                 let req: RpcRequest = match serde_json::from_str(&line) {
                     Ok(v) => v,
-                    Err(err) => {
-                        eprintln!("invalid json-rpc payload: {err}");
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
 
                 let response = handle_rpc_request(app.clone(), req).await;
@@ -162,6 +159,7 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
     {
         let mut state = app.state.write().await;
         state.is_ra_warm = false;
+        state.is_ra_warm_impl = false;
     }
 
     if workspace_changed {
@@ -176,6 +174,7 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         state.indexed_metadata_ids.clear();
         state.extraction_metrics = ExtractionMetrics::default();
         state.is_ra_warm = false;
+        state.is_ra_warm_impl = false;
         state.queue_depth = 0;
         state.indexing_in_progress = false;
         state.last_error = None;
@@ -183,9 +182,7 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         app.ra_manager.lock().await.reset().await;
     }
 
-    if let Err(err) = refresh_workspace_metadata(&app).await {
-        eprintln!("workspace metadata refresh failed: {err:#}");
-    }
+    let _ = refresh_workspace_metadata(&app).await;
 
     Ok(json!({
         "protocol_version": PROTOCOL_VERSION,
@@ -269,9 +266,7 @@ async fn handle_workspace_renamed(
         cfg.workspace_id = derive_workspace_id(&cfg.workspace_root);
         drop(cfg);
         app.ra_manager.lock().await.reset().await;
-        if let Err(err) = refresh_workspace_metadata(&app).await {
-            eprintln!("workspace metadata refresh failed after rename: {err:#}");
-        }
+        let _ = refresh_workspace_metadata(&app).await;
         return Ok(json!({"ok": true}));
     }
 

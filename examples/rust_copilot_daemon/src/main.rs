@@ -35,7 +35,7 @@ const SIGNATURE_VECTOR_NAME: &str = "signature";
 const BODY_VECTOR_NAME: &str = "body";
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const LSP_HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
-const LSP_CONTENT_MODIFIED_RETRIES: usize = 2;
+const LSP_CONTENT_MODIFIED_RETRIES: usize = 1;
 const LSP_WORK_DONE_SETTLE_TIMEOUT: Duration = Duration::from_millis(700);
 const LSP_WORK_DONE_POLL_INTERVAL: Duration = Duration::from_millis(60);
 const BULK_SCAN_QUEUE_DEPTH_THRESHOLD: usize = 32;
@@ -291,6 +291,7 @@ struct ExtractionMetrics {
     symbols_indexed_total: u64,
     relations_indexed_total: u64,
     hover_success_total: u64,
+    hover_nonempty_total: u64,
     hover_failed_total: u64,
     workspace_symbol_success_total: u64,
     workspace_symbol_failed_total: u64,
@@ -323,6 +324,7 @@ struct FileExtractionMetrics {
     symbols_indexed: usize,
     relations_indexed: usize,
     hover_success: u64,
+    hover_nonempty: u64,
     hover_failed: u64,
     workspace_symbol_success: u64,
     workspace_symbol_failed: u64,
@@ -380,6 +382,8 @@ struct State {
     extraction_metrics: ExtractionMetrics,
     /// True after a post-initialize warm-up extraction has completed.
     is_ra_warm: bool,
+    /// True after first implementation extraction pass has been discarded/requeued.
+    is_ra_warm_impl: bool,
 }
 
 impl State {
@@ -514,10 +518,21 @@ impl RaSessionManager {
             )
             .await?
         else {
+            eprintln!(
+                "[fallback-debug] file={} reason=documentSymbol_unsupported_or_none",
+                file_path_rel
+            );
             return Ok(Vec::new());
         };
         let mut docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
-        enrich_docs_with_lsp_metadata(session, &file_uri, &mut docs, bulk_mode, metrics).await?;
+        if docs.is_empty() {
+            eprintln!(
+                "[fallback-debug] file={} reason=documentSymbol_empty_after_parse",
+                file_path_rel
+            );
+        }
+        enrich_docs_with_lsp_metadata(session, &file_uri, content, &mut docs, bulk_mode, metrics)
+            .await?;
         Ok(docs)
     }
 
@@ -813,13 +828,11 @@ impl RaLspSession {
 
     async fn wait_for_work_done_settle(&mut self, timeout: Duration) -> Result<()> {
         if !self.saw_work_done_progress {
-            // eprintln!("work-done settle skipped: no $/progress notifications observed yet");
             return Ok(());
         }
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             if self.work_done_in_flight == 0 {
-                // eprintln!("work-done settled: in_flight=0");
                 return Ok(());
             }
             match tokio::time::timeout(
@@ -842,10 +855,6 @@ impl RaLspSession {
                 Err(_) => {}
             }
         }
-        eprintln!(
-            "rust-analyzer work-done still active after timeout: in_flight={}",
-            self.work_done_in_flight
-        );
         Ok(())
     }
 
@@ -1055,7 +1064,6 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind MCP endpoint at {mcp_bind_addr}"))?;
     let mcp_addr = mcp_listener.local_addr()?;
-
     eprintln!(
         "rust-copilot-daemon started: jsonrpc=stdio mcp=http://{} schema_version={}",
         mcp_addr, SCHEMA_VERSION
@@ -1225,12 +1233,6 @@ async fn process_batch(app: App, events: Vec<DirtyEvent>) {
         let queued_before = state.queue_depth;
         state.indexing_in_progress = true;
         state.queue_depth = state.queue_depth.saturating_sub(events.len());
-        eprintln!(
-            "indexer batch: events={} queued_before={} bulk_mode={}",
-            events.len(),
-            queued_before,
-            queued_before > BULK_SCAN_QUEUE_DEPTH_THRESHOLD || events.len() > 1
-        );
         queued_before > BULK_SCAN_QUEUE_DEPTH_THRESHOLD || events.len() > 1
     };
 
@@ -1275,12 +1277,6 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .unwrap_or(path)
         .to_string_lossy()
         .to_string();
-    eprintln!(
-        "reindex_file: ts_ms={} file_rel={} bulk_mode={}",
-        unix_ms_now(),
-        file_rel,
-        bulk_mode
-    );
 
     let (previous_ids, previous_relation_ids) = {
         let state = app.state.read().await;
@@ -1359,13 +1355,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                     .await
                 {
                     Ok(v) => v,
-                    Err(err) => {
-                        eprintln!(
-                            "rust-analyzer relation enrichment failed for {}: {err:#}",
-                            file_rel
-                        );
-                        Vec::new()
-                    }
+                    Err(_) => Vec::new(),
                 };
                 let counters_after = ra.session_counters();
                 file_metrics.content_modified_retries = counters_after
@@ -1385,16 +1375,19 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
+                eprintln!(
+                    "[fallback-debug] file={} reason=empty_symbol_docs bulk_mode={} content_modified_retries={} request_timeouts={}",
+                    file_rel,
+                    bulk_mode,
+                    file_metrics.content_modified_retries,
+                    file_metrics.request_timeouts
+                );
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
                     Vec::new(),
                 )
             }
             Err(err) => {
-                eprintln!(
-                    "rust-analyzer enrichment failed for {}: {err:#}. Falling back to heuristic extraction",
-                    file_rel
-                );
                 file_metrics.fallback_heuristic = true;
                 let counters_after = ra.session_counters();
                 file_metrics.content_modified_retries = counters_after
@@ -1403,6 +1396,14 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
+                eprintln!(
+                    "[fallback-debug] file={} reason=extract_symbol_docs_error bulk_mode={} content_modified_retries={} request_timeouts={} error={:#}",
+                    file_rel,
+                    bulk_mode,
+                    file_metrics.content_modified_retries,
+                    file_metrics.request_timeouts,
+                    err
+                );
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
                     Vec::new(),
@@ -1440,7 +1441,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
 
         if requeue_needed {
             eprintln!(
-                "rust-analyzer warm-up complete; discarding first pass and requeueing {}",
+                "[fallback-debug] file={} reason=warmup_discard_requeue",
                 file_rel
             );
             app.dirty_tx
@@ -1450,6 +1451,41 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         }
 
         return Ok(());
+    }
+
+    let impl_calls_in_file =
+        file_metrics.implementations_success + file_metrics.implementations_failed;
+    let should_discard_implementations_for_warmup = {
+        let state = app.state.read().await;
+        !state.is_ra_warm_impl && impl_calls_in_file > 0
+    };
+    if should_discard_implementations_for_warmup {
+        relation_docs.retain(|doc| doc.relation_kind != "implementations");
+        file_metrics.implementations_success = 0;
+        file_metrics.implementations_failed = 0;
+        file_metrics.implementations_nonempty = 0;
+        file_metrics.relations_implementations_emitted = 0;
+        let requeue_needed = {
+            let mut state = app.state.write().await;
+            if state.is_ra_warm_impl {
+                false
+            } else {
+                state.is_ra_warm_impl = true;
+                state.queue_depth = state.queue_depth.saturating_add(1);
+                true
+            }
+        };
+
+        if requeue_needed {
+            eprintln!(
+                "[fallback-debug] file={} reason=impl_warmup_discard_requeue",
+                file_rel
+            );
+            app.dirty_tx
+                .send(DirtyEvent::Index(path.to_path_buf()))
+                .await
+                .map_err(|_| anyhow::anyhow!("index queue unavailable during impl warm-up requeue"))?;
+        }
     }
 
     let symbol_rows = final_docs
@@ -1540,6 +1576,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
     metrics.symbols_indexed_total += file_metrics.symbols_indexed as u64;
     metrics.relations_indexed_total += file_metrics.relations_indexed as u64;
     metrics.hover_success_total += file_metrics.hover_success;
+    metrics.hover_nonempty_total += file_metrics.hover_nonempty;
     metrics.hover_failed_total += file_metrics.hover_failed;
     metrics.workspace_symbol_success_total += file_metrics.workspace_symbol_success;
     metrics.workspace_symbol_failed_total += file_metrics.workspace_symbol_failed;
@@ -2171,17 +2208,6 @@ async fn extract_symbol_relations_with_lsp(
     bulk_mode: bool,
     metrics: &mut FileExtractionMetrics,
 ) -> Result<Vec<SymbolRelationDoc>> {
-    let eligible_symbols = docs
-        .iter()
-        .filter(|doc| should_extract_relations_for_symbol(doc, bulk_mode))
-        .count();
-    eprintln!(
-        "relation extraction start: file_uri={} docs_total={} docs_eligible={} bulk_mode={}",
-        file_uri,
-        docs.len(),
-        eligible_symbols,
-        bulk_mode
-    );
     let source_lines = content.lines().collect::<Vec<_>>();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -2194,19 +2220,11 @@ async fn extract_symbol_relations_with_lsp(
         session
             .wait_for_work_done_settle(LSP_WORK_DONE_SETTLE_TIMEOUT)
             .await?;
-        eprintln!(
-            "relation extraction proceed: file_uri={} symbol={} saw_work_done_progress={} in_flight={}",
-            file_uri, doc.symbol, session.saw_work_done_progress, session.work_done_in_flight
-        );
-        eprintln!(
-            "relation symbol probe: symbol={} kind={} start_line={} start_character={}",
-            doc.symbol, doc.kind, doc.start_line, doc.start_character
-        );
         let position = json!({
             "line": doc.start_line.saturating_sub(1),
             "character": doc.start_character
         });
-        let definition_probe = session
+        let _ = session
             .request_if_supported(
                 "textDocument/definition",
                 json!({
@@ -2217,27 +2235,6 @@ async fn extract_symbol_relations_with_lsp(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
-        match &definition_probe {
-            Ok(Some(defs)) => {
-                eprintln!(
-                    "relation diagnostic: method=textDocument/definition-probe symbol={} locations={}",
-                    doc.symbol,
-                    lsp_locations_from_value(defs).len()
-                );
-            }
-            Ok(None) => {
-                eprintln!(
-                    "relation diagnostic: method=textDocument/definition-probe symbol={} unsupported",
-                    doc.symbol
-                );
-            }
-            Err(err) => {
-                eprintln!(
-                    "relation diagnostic: method=textDocument/definition-probe symbol={} error={}",
-                    doc.symbol, err
-                );
-            }
-        }
 
         let references = session
             .request_if_supported(
@@ -2252,11 +2249,6 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await;
         if let Ok(Some(references)) = references {
-            let ref_locations = lsp_locations_from_value(&references).len();
-            eprintln!(
-                "relation request result: method=textDocument/references symbol={} locations={}",
-                doc.symbol, ref_locations
-            );
             metrics.references_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2272,76 +2264,50 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await?;
             if emitted > 0 {
-                eprintln!("ref emitted {}", emitted);
                 metrics.references_nonempty += 1;
             }
             metrics.relations_references_emitted += emitted as u64;
-            eprintln!(
-                "relation emit: method=textDocument/references symbol={} emitted={}",
-                doc.symbol, emitted
-            );
         } else if references.is_err() {
-            eprintln!(
-                "relation request failed: method=textDocument/references symbol={}",
-                doc.symbol
-            );
             metrics.references_failed += 1;
-        } else {
-            eprintln!(
-                "relation request unsupported: method=textDocument/references symbol={}",
-                doc.symbol
-            );
         }
-        let implementations = session
-            .request_if_supported(
-                "textDocument/implementation",
-                json!({
-                    "textDocument": { "uri": file_uri },
-                    "position": position
-                }),
-                LSP_HEAVY_REQUEST_TIMEOUT,
-                LSP_CONTENT_MODIFIED_RETRIES,
-            )
-            .await;
-        if let Ok(Some(implementations)) = implementations {
-            let impl_locations = lsp_locations_from_value(&implementations).len();
-            eprintln!(
-                "relation request result: method=textDocument/implementation symbol={} locations={}",
-                doc.symbol, impl_locations
-            );
-            metrics.implementations_success += 1;
-            let emitted = append_relation_targets(
-                &mut out,
-                &mut seen,
-                &mut cache,
-                workspace_root,
-                workspace_id,
-                file_path_rel,
-                doc,
-                "implementations",
-                implementations,
-                &source_lines,
-            )
-            .await?;
-            if emitted > 0 {
-                metrics.implementations_nonempty += 1;
+        if should_request_implementations_for_symbol(doc) {
+            let implementations = session
+                .request_if_supported(
+                    "textDocument/implementation",
+                    json!({
+                        "textDocument": { "uri": file_uri },
+                        "position": position
+                    }),
+                    LSP_HEAVY_REQUEST_TIMEOUT,
+                    LSP_CONTENT_MODIFIED_RETRIES,
+                )
+                .await;
+            if let Ok(Some(implementations)) = implementations {
+                metrics.implementations_success += 1;
+                let emitted = append_relation_targets(
+                    &mut out,
+                    &mut seen,
+                    &mut cache,
+                    workspace_root,
+                    workspace_id,
+                    file_path_rel,
+                    doc,
+                    "implementations",
+                    implementations,
+                    &source_lines,
+                )
+                .await?;
+                if emitted > 0 {
+                    metrics.implementations_nonempty += 1;
+                }
+                metrics.relations_implementations_emitted += emitted as u64;
+            } else if let Err(err) = implementations {
+                metrics.implementations_failed += 1;
+                eprintln!(
+                    "[implementations-debug] file={} symbol={} kind={} start_line={} reason=request_error error={:#}",
+                    doc.file_path, doc.symbol, doc.kind, doc.start_line, err
+                );
             }
-            metrics.relations_implementations_emitted += emitted as u64;
-            eprintln!(
-                "relation emit: method=textDocument/implementation symbol={} emitted={}",
-                doc.symbol, emitted
-            );
-        } else if implementations.is_err() {
-            eprintln!(
-                "relation request failed: method=textDocument/implementation symbol={}",
-                doc.symbol
-            );
-            metrics.implementations_failed += 1;
-        } else {
-            eprintln!(
-                "relation request unsupported: method=textDocument/implementation symbol={}",
-                doc.symbol
-            );
         }
         let definitions = session
             .request_if_supported(
@@ -2355,11 +2321,6 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await;
         if let Ok(Some(definitions)) = definitions {
-            let def_locations = lsp_locations_from_value(&definitions).len();
-            eprintln!(
-                "relation request result: method=textDocument/definition symbol={} locations={}",
-                doc.symbol, def_locations
-            );
             metrics.definitions_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2378,21 +2339,8 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.definitions_nonempty += 1;
             }
             metrics.relations_definitions_emitted += emitted as u64;
-            eprintln!(
-                "relation emit: method=textDocument/definition symbol={} emitted={}",
-                doc.symbol, emitted
-            );
         } else if definitions.is_err() {
-            eprintln!(
-                "relation request failed: method=textDocument/definition symbol={}",
-                doc.symbol
-            );
             metrics.definitions_failed += 1;
-        } else {
-            eprintln!(
-                "relation request unsupported: method=textDocument/definition symbol={}",
-                doc.symbol
-            );
         }
         let type_definitions = session
             .request_if_supported(
@@ -2406,11 +2354,6 @@ async fn extract_symbol_relations_with_lsp(
             )
             .await;
         if let Ok(Some(type_definitions)) = type_definitions {
-            let type_def_locations = lsp_locations_from_value(&type_definitions).len();
-            eprintln!(
-                "relation request result: method=textDocument/typeDefinition symbol={} locations={}",
-                doc.symbol, type_def_locations
-            );
             metrics.type_definitions_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2429,21 +2372,8 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.type_definitions_nonempty += 1;
             }
             metrics.relations_type_definitions_emitted += emitted as u64;
-            eprintln!(
-                "relation emit: method=textDocument/typeDefinition symbol={} emitted={}",
-                doc.symbol, emitted
-            );
         } else if type_definitions.is_err() {
-            eprintln!(
-                "relation request failed: method=textDocument/typeDefinition symbol={}",
-                doc.symbol
-            );
             metrics.type_definitions_failed += 1;
-        } else {
-            eprintln!(
-                "relation request unsupported: method=textDocument/typeDefinition symbol={}",
-                doc.symbol
-            );
         }
     }
 
@@ -2639,14 +2569,22 @@ async fn excerpt_for_target(
 async fn enrich_docs_with_lsp_metadata(
     session: &mut RaLspSession,
     file_uri: &str,
+    content: &str,
     docs: &mut [RustItemDoc],
     bulk_mode: bool,
     metrics: &mut FileExtractionMetrics,
 ) -> Result<()> {
+    session
+        .wait_for_work_done_settle(LSP_WORK_DONE_SETTLE_TIMEOUT)
+        .await?;
+    let lines = content.lines().collect::<Vec<_>>();
+
     for doc in docs {
+        let primary_line = doc.start_line.saturating_sub(1);
+        let primary_character = doc.start_character;
         let position = json!({
-            "line": doc.start_line.saturating_sub(1),
-            "character": doc.start_character
+            "line": primary_line,
+            "character": primary_character
         });
 
         let hover = session
@@ -2664,8 +2602,42 @@ async fn enrich_docs_with_lsp_metadata(
         if let Ok(Some(hover)) = hover {
             metrics.hover_success += 1;
             doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
+            if doc.hover_summary.trim().is_empty()
+                && let Some((retry_line, retry_character)) = symbol_position_in_lsp_range(
+                    &lines,
+                    &doc.symbol,
+                    doc.start_line,
+                    doc.end_line,
+                )
+                && (retry_line.saturating_sub(1) != primary_line
+                    || retry_character != primary_character)
+            {
+                let retry_hover = session
+                    .request_if_supported(
+                        "textDocument/hover",
+                        json!({
+                            "textDocument": { "uri": file_uri },
+                            "position": {
+                                "line": retry_line.saturating_sub(1),
+                                "character": retry_character
+                            }
+                        }),
+                        LSP_REQUEST_TIMEOUT,
+                        LSP_CONTENT_MODIFIED_RETRIES,
+                    )
+                    .await;
+                if let Ok(Some(hover)) = retry_hover {
+                    let retry_summary = lsp_hover_to_text(&hover).unwrap_or_default();
+                    if !retry_summary.trim().is_empty() {
+                        doc.hover_summary = retry_summary;
+                    }
+                }
+            }
         } else if hover.is_err() {
             metrics.hover_failed += 1;
+        }
+        if !doc.hover_summary.trim().is_empty() {
+            metrics.hover_nonempty += 1;
         }
         // signature_help is more often than not null, mainly usefull for IDE scenarios
         /*
@@ -2728,6 +2700,10 @@ fn should_extract_relations_for_symbol(doc: &RustItemDoc, bulk_mode: bool) -> bo
         "fn" | "struct" | "enum" | "trait" => true,
         _ => !bulk_mode,
     }
+}
+
+fn should_request_implementations_for_symbol(doc: &RustItemDoc) -> bool {
+    matches!(doc.kind.as_str(), "trait" | "struct" | "method")
 }
 
 fn lsp_hover_to_text(result: &Value) -> Option<String> {
@@ -2945,16 +2921,13 @@ fn update_work_done_progress_state(msg: &Value, in_flight: &mut usize, saw_progr
         Some("begin") => {
             *saw_progress = true;
             *in_flight = in_flight.saturating_add(1);
-            // eprintln!("work-done progress begin: in_flight={}", *in_flight);
         }
         Some("end") => {
             *saw_progress = true;
             *in_flight = in_flight.saturating_sub(1);
-            // eprintln!("work-done progress end: in_flight={}", *in_flight);
         }
         Some("report") => {
             *saw_progress = true;
-            // eprintln!("work-done progress report: in_flight={}", *in_flight);
         }
         _ => {}
     }

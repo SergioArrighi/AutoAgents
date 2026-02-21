@@ -22,9 +22,7 @@ pub(super) async fn run_mcp_server(
                 let (stream, _) = accepted?;
                 let app_clone = app.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_http_connection(app_clone, stream).await {
-                        eprintln!("mcp connection error: {err}");
-                    }
+                    let _ = handle_http_connection(app_clone, stream).await;
                 });
             }
         }
