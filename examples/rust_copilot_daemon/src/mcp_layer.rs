@@ -689,6 +689,78 @@ async fn handle_mcp_explain_relevance(
     app: App,
     req: ExplainRelevanceRequest,
 ) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, None, 5);
+    let vector_name = req
+        .vector_name
+        .clone()
+        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let mut candidate_scores: HashMap<String, f64> = HashMap::new();
+    let resolved_point_ids =
+        if let Some(point_ids) = req.point_ids.clone().filter(|ids| !ids.is_empty()) {
+            point_ids
+        } else {
+            let lexical = lexical_search(
+                app.state.read().await.rust_items_by_file.clone(),
+                &req.query,
+                top_k,
+            );
+
+            let semantic = {
+                let services = app.services.read().await.clone();
+                let request = VectorSearchRequest::builder()
+                    .query(req.query.clone())
+                    .query_vector_name(vector_name.clone())
+                    .samples(top_k as u64)
+                    .build()
+                    .map_err(|err| RpcError {
+                        code: 400,
+                        message: format!("invalid explain request: {err}"),
+                    })?;
+
+                services
+                    .store
+                    .top_n::<RustItemDoc>(request)
+                    .await
+                    .map_err(|err| RpcError {
+                        code: 500,
+                        message: format!("semantic explain search failed: {err}"),
+                    })?
+            };
+
+            let mut merged: HashMap<String, (f64, RustItemDoc)> = HashMap::new();
+
+            for (score, item) in lexical {
+                if matches_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                    merged
+                        .entry(item.id.clone())
+                        .and_modify(|entry| entry.0 += score * 0.4)
+                        .or_insert((score * 0.4, item));
+                }
+            }
+
+            for (score, _, item) in semantic {
+                if matches_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                    merged
+                        .entry(item.id.clone())
+                        .and_modify(|entry| entry.0 += score * 0.6)
+                        .or_insert((score * 0.6, item));
+                }
+            }
+
+            let mut rows = merged.into_values().collect::<Vec<_>>();
+            rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            rows.truncate(top_k);
+
+            rows.into_iter()
+                .map(|(score, item)| {
+                    candidate_scores.insert(item.id.clone(), score);
+                    item.id
+                })
+                .collect::<Vec<_>>()
+        };
+
     let state = app.state.read().await;
     let query_tokens = req
         .query
@@ -697,18 +769,17 @@ async fn handle_mcp_explain_relevance(
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>();
 
+    let mut items_by_id = HashMap::new();
+    for items in state.rust_items_by_file.values() {
+        for item in items {
+            items_by_id.insert(item.id.clone(), item.clone());
+        }
+    }
+
     let mut explanations = Vec::new();
 
-    for point_id in req.point_ids {
-        let mut maybe_item: Option<RustItemDoc> = None;
-        for items in state.rust_items_by_file.values() {
-            if let Some(found) = items.iter().find(|item| item.id == point_id) {
-                maybe_item = Some(found.clone());
-                break;
-            }
-        }
-
-        if let Some(item) = maybe_item {
+    for point_id in &resolved_point_ids {
+        if let Some(item) = items_by_id.get(point_id) {
             let lower = rust_item_search_text(&item).to_lowercase();
             let matched = query_tokens
                 .iter()
@@ -720,6 +791,7 @@ async fn handle_mcp_explain_relevance(
                 "point_id": item.id,
                 "file_path": item.file_path,
                 "item": item,
+                "score": candidate_scores.get(&item.id).copied(),
                 "matched_terms": matched,
                 "reason": "Item matched lexical terms and/or semantic embedding neighborhood.",
             }));
@@ -729,6 +801,8 @@ async fn handle_mcp_explain_relevance(
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name,
+        "resolved_point_ids": resolved_point_ids,
         "explanation": explanations,
     }))
 }

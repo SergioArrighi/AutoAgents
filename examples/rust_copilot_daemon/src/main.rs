@@ -1017,7 +1017,10 @@ struct SearchRelationsRequest {
 #[derive(Debug, Deserialize)]
 struct ExplainRelevanceRequest {
     query: String,
-    point_ids: Vec<String>,
+    point_ids: Option<Vec<String>>,
+    limit: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<SearchFilters>,
 }
 
 /// Entry point: starts shared services and both communication planes.
@@ -2655,7 +2658,7 @@ async fn enrich_docs_with_lsp_metadata(
                     &doc.symbol,
                     doc.start_line,
                 ) {
-                    doc.symbol_path = path;
+                    maybe_upgrade_symbol_path(doc, &path);
                     metrics.workspace_symbol_nonempty += 1;
                 }
             } else if ws_symbol.is_err() {
@@ -2738,6 +2741,55 @@ fn lsp_workspace_symbol_path_for_item(
         }
     }
     best.map(|(_, v)| v)
+}
+
+fn maybe_upgrade_symbol_path(doc: &mut RustItemDoc, workspace_path: &str) {
+    let candidate = normalize_symbol_path_candidate(&doc.module, &doc.symbol, workspace_path);
+    if candidate.is_empty() {
+        return;
+    }
+    if symbol_path_leaf(&candidate) != doc.symbol {
+        return;
+    }
+
+    let current = doc.symbol_path.trim();
+    let should_replace = current.is_empty()
+        || symbol_path_leaf(current) != doc.symbol
+        || symbol_path_quality(&candidate) > symbol_path_quality(current);
+
+    if should_replace {
+        doc.symbol_path = candidate;
+    }
+}
+
+fn normalize_symbol_path_candidate(module: &str, symbol: &str, candidate: &str) -> String {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.contains("::") {
+        return trimmed.to_string();
+    }
+
+    if !module.is_empty() && trimmed == symbol {
+        return format!("{module}::{trimmed}");
+    }
+
+    trimmed.to_string()
+}
+
+fn symbol_path_quality(path: &str) -> (usize, usize) {
+    let path = path.trim();
+    if path.is_empty() {
+        return (0, 0);
+    }
+    let segments = path.split("::").filter(|part| !part.is_empty()).count();
+    (segments, path.len())
+}
+
+fn symbol_path_leaf(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
 }
 
 fn lsp_marked_content_to_text(contents: &Value) -> Option<String> {
@@ -3611,5 +3663,40 @@ pub struct Thing {
             "rust-analyzer returned error: {{\"code\":-32601,\"message\":\"Method not found\"}}"
         );
         assert!(is_method_unsupported_error(&err));
+    }
+
+    #[test]
+    fn explain_relevance_request_accepts_query_only_payload() {
+        let req: ExplainRelevanceRequest = serde_json::from_value(json!({
+            "query": "find trait impls",
+            "limit": 3
+        }))
+        .expect("query-only explain_relevance payload should deserialize");
+
+        assert_eq!(req.query, "find trait impls");
+        assert_eq!(req.limit, Some(3));
+        assert!(req.point_ids.is_none());
+    }
+
+    #[test]
+    fn maybe_upgrade_symbol_path_does_not_downgrade_to_unqualified_name() {
+        let mut doc = sample_item("src/lib.rs", "c1", "trait", "Rule", "trait Rule");
+        doc.module = "src::lib".to_string();
+        doc.symbol_path = "src::lib::Rule".to_string();
+
+        maybe_upgrade_symbol_path(&mut doc, "Rule");
+
+        assert_eq!(doc.symbol_path, "src::lib::Rule");
+    }
+
+    #[test]
+    fn maybe_upgrade_symbol_path_updates_empty_path_with_workspace_value() {
+        let mut doc = sample_item("src/lib.rs", "c2", "fn", "evaluate", "fn evaluate()");
+        doc.module = "src::lib".to_string();
+        doc.symbol_path.clear();
+
+        maybe_upgrade_symbol_path(&mut doc, "evaluate");
+
+        assert_eq!(doc.symbol_path, "src::lib::evaluate");
     }
 }
