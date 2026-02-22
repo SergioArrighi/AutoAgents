@@ -5,6 +5,9 @@
 
 use super::*;
 
+const RELATION_CANDIDATE_POOL_MIN: usize = 48;
+const RELATION_CANDIDATE_POOL_MAX: usize = 128;
+
 /// Runs the localhost MCP HTTP server loop until a stop signal is received.
 pub(super) async fn run_mcp_server(
     app: App,
@@ -233,9 +236,10 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
             vector_name.as_deref(),
             semantic_samples,
             &[
-                (SYMBOL_VECTOR_NAME, 0.50),
-                (DOCS_VECTOR_NAME, 0.30),
-                (SIGNATURE_VECTOR_NAME, 0.20),
+                (SYMBOL_VECTOR_NAME, 0.45),
+                (DOCS_VECTOR_NAME, 0.25),
+                (SIGNATURE_VECTOR_NAME, 0.15),
+                (TYPE_VECTOR_NAME, 0.15),
             ],
             |item: &schema::SymbolDoc| {
                 matches_filters(item, req.filters.as_ref(), &default_workspace_id)
@@ -293,7 +297,9 @@ async fn handle_mcp_search_relations(
     let top_k = resolve_limit(req.limit, req.top_k, 8);
     let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
-    let semantic_samples = (top_k.saturating_mul(4)).clamp(top_k, 64);
+    let semantic_samples = top_k
+        .saturating_mul(4)
+        .clamp(RELATION_CANDIDATE_POOL_MIN, RELATION_CANDIDATE_POOL_MAX);
 
     let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
@@ -303,10 +309,12 @@ async fn handle_mcp_search_relations(
             vector_name.as_deref(),
             semantic_samples,
             &[
-                (SYMBOL_VECTOR_NAME, 0.45),
-                (DOCS_VECTOR_NAME, 0.25),
-                (SIGNATURE_VECTOR_NAME, 0.20),
+                (SYMBOL_VECTOR_NAME, 0.30),
+                (DOCS_VECTOR_NAME, 0.20),
+                (SIGNATURE_VECTOR_NAME, 0.15),
                 (BODY_VECTOR_NAME, 0.10),
+                (TYPE_VECTOR_NAME, 0.10),
+                (GRAPH_VECTOR_NAME, 0.15),
             ],
             |item: &schema::GraphEdgeDoc| {
                 matches_relation_filters(item, req.filters.as_ref(), &default_workspace_id)
@@ -399,7 +407,11 @@ async fn handle_mcp_search_calls(app: App, req: SearchCallsRequest) -> Result<Va
             &req.query,
             vector_name.as_deref(),
             semantic_samples,
-            &[(SYMBOL_VECTOR_NAME, 0.50), (DOCS_VECTOR_NAME, 0.50)],
+            &[
+                (SYMBOL_VECTOR_NAME, 0.35),
+                (DOCS_VECTOR_NAME, 0.30),
+                (GRAPH_VECTOR_NAME, 0.35),
+            ],
             |item: &schema::CallEdge| {
                 matches_call_edge_filters(item, req.filters.as_ref(), &default_workspace_id)
             },
@@ -445,7 +457,12 @@ async fn handle_mcp_search_types(app: App, req: SearchTypesRequest) -> Result<Va
             &req.query,
             vector_name.as_deref(),
             semantic_samples,
-            &[(SYMBOL_VECTOR_NAME, 0.45), (DOCS_VECTOR_NAME, 0.55)],
+            &[
+                (SYMBOL_VECTOR_NAME, 0.25),
+                (DOCS_VECTOR_NAME, 0.25),
+                (TYPE_VECTOR_NAME, 0.30),
+                (GRAPH_VECTOR_NAME, 0.20),
+            ],
             |item: &schema::TypeEdge| {
                 matches_type_edge_filters(item, req.filters.as_ref(), &default_workspace_id)
             },
@@ -1630,9 +1647,10 @@ async fn handle_mcp_explain_relevance(
                     vector_name.as_deref(),
                     semantic_samples,
                     &[
-                        (SYMBOL_VECTOR_NAME, 0.50),
-                        (DOCS_VECTOR_NAME, 0.30),
-                        (SIGNATURE_VECTOR_NAME, 0.20),
+                        (SYMBOL_VECTOR_NAME, 0.45),
+                        (DOCS_VECTOR_NAME, 0.25),
+                        (SIGNATURE_VECTOR_NAME, 0.15),
+                        (TYPE_VECTOR_NAME, 0.15),
                     ],
                     |item: &schema::SymbolDoc| {
                         matches_filters(item, req.filters.as_ref(), &default_workspace_id)

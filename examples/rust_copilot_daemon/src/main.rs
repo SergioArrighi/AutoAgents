@@ -34,6 +34,8 @@ const SYMBOL_VECTOR_NAME: &str = "symbol";
 const DOCS_VECTOR_NAME: &str = "docs";
 const SIGNATURE_VECTOR_NAME: &str = "signature";
 const BODY_VECTOR_NAME: &str = "body";
+const TYPE_VECTOR_NAME: &str = "type";
+const GRAPH_VECTOR_NAME: &str = "graph";
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const LSP_HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const LSP_CONTENT_MODIFIED_RETRIES: usize = 1;
@@ -2373,7 +2375,26 @@ fn rust_item_named_vectors(doc: &schema::SymbolDoc) -> HashMap<String, String> {
                 workspace_id = doc.workspace_id,
             ),
         ),
+        (
+            TYPE_VECTOR_NAME.to_string(),
+            symbol_type_vector_text(doc),
+        ),
     ])
+}
+
+fn symbol_type_vector_text(doc: &schema::SymbolDoc) -> String {
+    format!(
+        "kind: {kind}\nvisibility: {visibility}\ngenerics: {generics}\nwhere: {where_clause}\nreceiver: {receiver}\nreturn: {return_type}\nsymbol: {symbol}\npath: {symbol_path}\nworkspace_id: {workspace_id}",
+        kind = doc.kind,
+        visibility = doc.visibility.clone().unwrap_or_default(),
+        generics = doc.generics.clone().unwrap_or_default(),
+        where_clause = doc.where_clause.clone().unwrap_or_default(),
+        receiver = doc.receiver.clone().unwrap_or_default(),
+        return_type = doc.return_type.clone().unwrap_or_default(),
+        symbol = doc.symbol,
+        symbol_path = doc.symbol_path,
+        workspace_id = doc.workspace_id,
+    )
 }
 
 fn relation_search_text(doc: &schema::GraphEdgeDoc) -> String {
@@ -2421,6 +2442,21 @@ fn relation_named_vectors(doc: &schema::GraphEdgeDoc) -> HashMap<String, String>
                 source_symbol = doc.source_symbol,
                 source_file = doc.source_file_path,
                 line = doc.target_start_line,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            GRAPH_VECTOR_NAME.to_string(),
+            relation_search_text(doc),
+        ),
+        (
+            TYPE_VECTOR_NAME.to_string(),
+            format!(
+                "edge_type: {edge_type}\nrelation_kind: {relation_kind}\nsource_symbol: {source_symbol}\nsource_crate: {source_crate}\nworkspace_id: {workspace_id}",
+                edge_type = doc.edge_type,
+                relation_kind = doc.relation_kind,
+                source_symbol = doc.source_symbol,
+                source_crate = doc.source_crate_name,
                 workspace_id = doc.workspace_id,
             ),
         ),
@@ -2547,6 +2583,10 @@ fn call_edge_named_vectors(doc: &schema::CallEdge) -> HashMap<String, String> {
             DOCS_VECTOR_NAME.to_string(),
             call_edge_search_text(doc),
         ),
+        (
+            GRAPH_VECTOR_NAME.to_string(),
+            call_edge_search_text(doc),
+        ),
     ])
 }
 
@@ -2576,6 +2616,14 @@ fn type_edge_named_vectors(doc: &schema::TypeEdge) -> HashMap<String, String> {
         ),
         (
             DOCS_VECTOR_NAME.to_string(),
+            type_edge_search_text(doc),
+        ),
+        (
+            TYPE_VECTOR_NAME.to_string(),
+            type_edge_search_text(doc),
+        ),
+        (
+            GRAPH_VECTOR_NAME.to_string(),
             type_edge_search_text(doc),
         ),
     ])
