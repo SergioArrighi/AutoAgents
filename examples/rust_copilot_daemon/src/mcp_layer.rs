@@ -254,7 +254,7 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
             .into_iter()
             .map(|(score, item)| json!({
                 "score": score,
-                "item": item,
+                "item": canonical_symbol_doc(&item),
             }))
             .collect::<Vec<_>>(),
     }))
@@ -316,7 +316,7 @@ async fn handle_mcp_search_relations(
             .into_iter()
             .map(|(score, item)| json!({
                 "score": score,
-                "item": item,
+                "item": canonical_relation_doc(&item),
             }))
             .collect::<Vec<_>>(),
     }))
@@ -357,6 +357,14 @@ pub(super) fn lexical_search(
 
 fn resolve_limit(limit: Option<usize>, top_k: Option<usize>, default: usize) -> usize {
     limit.or(top_k).unwrap_or(default).max(1)
+}
+
+fn canonical_symbol_doc(item: &RustItemDoc) -> schema::SymbolDoc {
+    schema::SymbolDoc::from_legacy(item)
+}
+
+fn canonical_relation_doc(item: &SymbolRelationDoc) -> schema::GraphEdgeDoc {
+    schema::GraphEdgeDoc::from_legacy(item)
 }
 
 fn rerank_relation_results(
@@ -538,7 +546,10 @@ async fn handle_mcp_get_file_chunks(
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "items": items,
+        "items": items
+            .iter()
+            .map(canonical_symbol_doc)
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -566,7 +577,7 @@ async fn handle_mcp_get_symbol_context(
                     "file_path": file_path,
                     "start_line": item.start_line,
                     "end_line": item.end_line,
-                    "item": item,
+                    "item": canonical_symbol_doc(item),
                 }));
             }
         }
@@ -649,7 +660,7 @@ async fn handle_mcp_get_symbol_relations(
             if relation_matches_symbol(item, &req.symbol) {
                 relations.push(json!({
                     "file_path": file_path,
-                    "item": item,
+                    "item": canonical_relation_doc(item),
                 }));
             }
         }
@@ -1131,7 +1142,7 @@ async fn handle_mcp_explain_relevance(
             explanations.push(json!({
                 "point_id": item.id,
                 "file_path": item.file_path,
-                "item": item,
+                "item": canonical_symbol_doc(item),
                 "score": candidate_scores.get(&item.id).copied(),
                 "matched_terms": matched,
                 "matched_term_scores": matched_term_scores,

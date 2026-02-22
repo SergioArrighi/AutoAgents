@@ -94,6 +94,8 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 - Ingestion is queue-based, with debounce + batch processing for file-change storms.
 - Query plane is read-only and returns `indexing_in_progress`.
 - `search_relations` uses semantic retrieval plus intent-aware reranking: query terms like `implements`, `defined`, `references`, and `type definition` boost matching relation kinds.
+- MCP responses now emit canonical schema payloads (`SymbolDoc` / typed graph edge docs).
+- Canonical indexing schema includes `SymbolDoc`, `FileDoc`, typed graph edges, and `DiagnosticDoc`.
 - JSON-RPC returns `{protocol_version, daemon_version}` on initialize.
 - MCP responses include `schema_version`.
 - HTTP binds only to `127.0.0.1`.
@@ -108,19 +110,34 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 
 Type-level graph edges (`typeDefinition`, call hierarchy, trait bounds graph) are not yet persisted as dedicated relation documents.
 
-## Deterministic Metrics Fixture
+## Retrieval Eval Contract
 
-Use `examples/rust_copilot_metrics_fixture` to validate extraction behavior against a known baseline with real symbols and non-zero relation output.
+Retrieval quality goals and fixture contract are versioned in:
 
-Expected metrics:
+- `docs/rust_copilot/retrieval_goals.md`
+- `examples/rust_copilot_daemon/eval/query_taxonomy.json`
+- `examples/rust_copilot_daemon/eval/goldens/rust_copilot_metrics_fixture.contract.json`
 
-- `examples/rust_copilot_daemon/eval/fixtures/rust_copilot_metrics_fixture.expected.json`
+Offline scorer (CI/local):
 
-Validation flow:
+```bash
+cargo test -p rust-copilot-daemon --test eval_contract -- --nocapture
+```
 
-1. `initialize` with `workspaceRoot` set to `examples/rust_copilot_metrics_fixture`.
-2. Send one `scan.full` with default globs.
-3. Wait for `status.indexing_in_progress=false` and `status.queue_depth=0`.
-4. Compare `status.extraction_metrics` to the expected JSON.
+The scorer compares an observed fixture snapshot against contract gates:
 
-Run against a fresh initialize/session because extraction metrics are cumulative.
+- extraction metrics
+- index cardinality (`total_files`, `total_chunks`, `workspace_crates`)
+- Qdrant collection point counts
+- retrieval intent assertions (for example relation query intent)
+
+By default it uses:
+
+- `examples/rust_copilot_daemon/eval/observed/rust_copilot_metrics_fixture.sample.json`
+
+Override with a fresh captured snapshot:
+
+```bash
+RUST_COPILOT_EVAL_OBSERVED_JSON=/path/to/observed.json \
+cargo test -p rust-copilot-daemon --test eval_contract -- --nocapture
+```

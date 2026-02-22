@@ -1,38 +1,61 @@
 # Rust Copilot Retrieval Goals
 
-## Task Classes
+This document defines the retrieval quality contract for
+`examples/rust_copilot_daemon` on the deterministic fixture project
+`examples/rust_copilot_metrics_fixture`.
 
-- symbol_lookup: Find exact or near-exact symbol definitions quickly.
-- api_usage: Find idiomatic usage examples and signatures.
-- refactor_support: Find related definitions/usages across files.
-- diagnostics_fixing: Find relevant symbols and relation context for fixes.
-- test_authoring: Find existing tests/fixtures and target API context.
+## Scope
 
-## Targets
+- Workspace: `examples/rust_copilot_metrics_fixture`
+- Query taxonomy: `examples/rust_copilot_daemon/eval/query_taxonomy.json`
+- Golden contract: `examples/rust_copilot_daemon/eval/goldens/rust_copilot_metrics_fixture.contract.json`
+- Default observed snapshot: `examples/rust_copilot_daemon/eval/observed/rust_copilot_metrics_fixture.sample.json`
 
-- Recall@5
-  - symbol_lookup: >= 0.92
-  - api_usage: >= 0.88
-  - refactor_support: >= 0.85
-  - diagnostics_fixing: >= 0.82
-  - test_authoring: >= 0.80
-- P95 query latency (daemon-side retrieval only): <= 350ms at top_k=8.
-- Index freshness SLA: <= 3s from file change event to searchable update.
+## Target Tasks
 
-## Indexing Contract
+1. Behavior lookup: answer "what does this function do?" from indexed symbols/tests.
+2. Symbol navigation: resolve symbol context and location quickly.
+3. Relation lookup: return relation-kind-consistent results for intentful relation queries.
+4. Metadata lookup: return crate/workspace metadata needed for code-agent planning.
 
-- Primary unit: symbol-level documents.
-- Secondary unit: file-context windows.
-- Graph unit: typed relation edges.
-- Metadata unit: crate/workspace docs.
+## Quality Targets
 
-## Eval Inputs
+1. Relation intent accuracy: for query patterns containing explicit relation intent terms
+   (`implements`, `defined`, `references`, `type definition`), top result should match
+   the intended relation kind in fixture eval queries.
+2. Extraction reliability:
+   - All `*_failed_total` counters are `0`.
+   - Non-empty relation counters are positive (`references`, `implementations`,
+     `definitions`, `type_definitions`).
+3. Index completeness:
+   - `total_files`, `total_chunks`, and `workspace_crates` match the fixture contract.
+   - Qdrant point counts for `rust_copilot_symbols`, `rust_copilot_relations`,
+     `rust_copilot_metadata` match the fixture contract.
 
-- Taxonomy source: `examples/rust_copilot_daemon/eval/query_taxonomy.json`
-- Goldens source: `examples/rust_copilot_daemon/eval/goldens/*.json`
+## Latency Budgets (Local Dev)
 
-## Reporting
+Budgets are measured from MCP endpoints on localhost with warm services:
 
-- Report Recall@k by task class.
-- Report median/p95 latency by query class.
-- Report stale index age for each eval run.
+1. `search_code` p95 <= 400 ms
+2. `search_relations` p95 <= 350 ms
+3. `get_symbol_context` p95 <= 250 ms
+
+Latency budgets are currently policy targets; they are not hard-gated by the offline scorer.
+
+## Freshness SLA
+
+After `scan.full`:
+
+1. `indexing_in_progress=false`
+2. `queue_depth=0`
+3. `indexed_at_unix_ms` updated
+
+These are required before collecting an observed snapshot for scoring.
+
+## Evaluation Command
+
+```bash
+cargo test -p rust-copilot-daemon --test eval_contract -- --nocapture
+```
+
+Use `RUST_COPILOT_EVAL_OBSERVED_JSON` to score a custom observed snapshot.

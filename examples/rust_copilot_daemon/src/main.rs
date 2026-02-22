@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 mod jsonrpc_layer;
 mod mcp_layer;
+mod schema;
 
 /// JSON-RPC protocol version returned by the sync plane.
 const PROTOCOL_VERSION: &str = "0.1.0";
@@ -77,7 +78,7 @@ impl Default for RuntimeConfig {
             qdrant_url: std::env::var("QDRANT_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:6334".to_string()),
             qdrant_collection: std::env::var("QDRANT_COLLECTION")
-                .unwrap_or_else(|_| "rust_copilot_chunks".to_string()),
+                .unwrap_or_else(|_| "rust_copilot_symbols".to_string()),
             qdrant_relation_collection: std::env::var("QDRANT_RELATION_COLLECTION")
                 .unwrap_or_else(|_| "rust_copilot_relations".to_string()),
             qdrant_metadata_collection: std::env::var("QDRANT_METADATA_COLLECTION")
@@ -1496,7 +1497,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .iter()
         .map(|doc| NamedVectorDocument {
             id: doc.id.clone(),
-            raw: doc.clone(),
+            raw: schema::SymbolDoc::from_legacy(doc),
             vectors: rust_item_named_vectors(doc),
         })
         .collect::<Vec<_>>();
@@ -1512,7 +1513,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .iter()
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
-                raw: doc.clone(),
+                raw: schema::GraphEdgeDoc::from_legacy(doc),
                 vectors: relation_named_vectors(doc),
             })
             .collect::<Vec<_>>();
@@ -2259,7 +2260,9 @@ async fn extract_symbol_relations_with_lsp(
                 LSP_CONTENT_MODIFIED_RETRIES,
             )
             .await;
+        let mut references_payload: Option<Value> = None;
         if let Ok(Some(references)) = references {
+            references_payload = Some(references.clone());
             metrics.references_success += 1;
             let emitted = append_relation_targets(
                 &mut out,
@@ -2295,7 +2298,7 @@ async fn extract_symbol_relations_with_lsp(
                 .await;
             if let Ok(Some(implementations)) = implementations {
                 metrics.implementations_success += 1;
-                let emitted = append_relation_targets(
+                let mut emitted = append_relation_targets(
                     &mut out,
                     &mut seen,
                     &mut cache,
@@ -2308,6 +2311,25 @@ async fn extract_symbol_relations_with_lsp(
                     &source_lines,
                 )
                 .await?;
+                if emitted == 0
+                    && should_fallback_implementations_from_references(doc)
+                    && let Some(payload) = references_payload.clone()
+                {
+                    emitted += append_relation_targets_with_filter(
+                        &mut out,
+                        &mut seen,
+                        &mut cache,
+                        workspace_root,
+                        workspace_id,
+                        file_path_rel,
+                        doc,
+                        "implementations",
+                        payload,
+                        &source_lines,
+                        |excerpt| excerpt_is_impl_for_symbol(excerpt, &doc.symbol),
+                    )
+                    .await?;
+                }
                 if emitted > 0 {
                     metrics.implementations_nonempty += 1;
                 }
@@ -2491,6 +2513,35 @@ async fn append_relation_targets(
     payload: Value,
     source_lines: &[&str],
 ) -> Result<usize> {
+    append_relation_targets_with_filter(
+        out,
+        seen,
+        cache,
+        workspace_root,
+        workspace_id,
+        source_file_path,
+        source_doc,
+        relation_kind,
+        payload,
+        source_lines,
+        |_| true,
+    )
+    .await
+}
+
+async fn append_relation_targets_with_filter(
+    out: &mut Vec<SymbolRelationDoc>,
+    seen: &mut HashSet<String>,
+    cache: &mut HashMap<PathBuf, Vec<String>>,
+    workspace_root: &Path,
+    workspace_id: &str,
+    source_file_path: &str,
+    source_doc: &RustItemDoc,
+    relation_kind: &str,
+    payload: Value,
+    source_lines: &[&str],
+    keep_target: impl Fn(&str) -> bool,
+) -> Result<usize> {
     let locations = lsp_locations_from_value(&payload);
     let mut emitted = 0usize;
     for loc in locations {
@@ -2529,6 +2580,9 @@ async fn append_relation_targets(
         if relation_target_is_low_signal(&excerpt) {
             continue;
         }
+        if !keep_target(&excerpt) {
+            continue;
+        }
 
         let id = format!(
             "relation:{workspace_id}:{kind}:{source}:{target}:{start}:{end}",
@@ -2557,6 +2611,23 @@ async fn append_relation_targets(
         emitted += 1;
     }
     Ok(emitted)
+}
+
+fn excerpt_is_impl_for_symbol(excerpt: &str, symbol: &str) -> bool {
+    let Some(first) = excerpt.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) else {
+        return false;
+    };
+
+    first.starts_with("impl ")
+        && first.contains(symbol)
+        && (first.contains(" for ") || first.contains('{'))
 }
 
 fn relation_target_is_low_signal(excerpt: &str) -> bool {
@@ -2803,6 +2874,10 @@ fn should_extract_relations_for_symbol(doc: &RustItemDoc, bulk_mode: bool) -> bo
 
 fn should_request_implementations_for_symbol(doc: &RustItemDoc) -> bool {
     matches!(doc.kind.as_str(), "trait" | "struct" | "method")
+}
+
+fn should_fallback_implementations_from_references(doc: &RustItemDoc) -> bool {
+    matches!(doc.kind.as_str(), "struct" | "enum")
 }
 
 fn should_request_type_definitions_for_symbol(doc: &RustItemDoc) -> bool {
@@ -3129,8 +3204,7 @@ fn collect_lsp_symbol_docs(
     if let Some((start_line, start_character, end_line)) = lsp_symbol_position_range(item) {
         let start_idx = start_line.saturating_sub(1);
         let end_idx = end_line.saturating_sub(1);
-        let signature_line = lines.get(start_idx).copied().unwrap_or("");
-        let signature = signature_line.trim().to_string();
+        let signature = collect_signature(lines, start_idx, end_idx);
         let docs = collect_docs_above(lines, start_idx);
         let excerpt = excerpt_from_range(lines, start_idx, end_idx, 60);
         let id = format!("symbol:{workspace_id}:{file_path}:{kind}:{name}:{start_line}:{end_line}");
@@ -3257,7 +3331,7 @@ fn extract_symbol_docs_heuristic(
 
         let start_line = line_idx + 1;
         let end_line = find_item_end_line(&lines, line_idx);
-        let signature = lines[line_idx].trim().to_string();
+        let signature = collect_signature(&lines, line_idx, end_line.saturating_sub(1));
         let symbol = extract_symbol(kind, line).unwrap_or_else(|| format!("item_{start_line}"));
         let item_docs = collect_docs_above(&lines, line_idx);
         let body_excerpt = excerpt_from_range(&lines, line_idx, end_line.saturating_sub(1), 60);
@@ -3458,6 +3532,33 @@ fn collect_docs_above(lines: &[&str], start_idx: usize) -> String {
     }
     docs.reverse();
     docs.join("\n")
+}
+
+fn collect_signature(lines: &[&str], start_idx: usize, end_idx: usize) -> String {
+    if lines.is_empty() || start_idx >= lines.len() {
+        return String::new();
+    }
+
+    let stop_idx = end_idx.min(lines.len().saturating_sub(1)).min(start_idx + 8);
+    let mut parts = Vec::<String>::new();
+
+    for idx in start_idx..=stop_idx {
+        let line = lines[idx].trim();
+        if line.is_empty() {
+            if !parts.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        parts.push(line.to_string());
+
+        if line.contains('{') || line.ends_with(';') {
+            break;
+        }
+    }
+
+    parts.join(" ")
 }
 
 fn find_item_end_line(lines: &[&str], start_idx: usize) -> usize {
@@ -3803,6 +3904,30 @@ pub struct Thing {
     }
 
     #[test]
+    fn extract_symbol_docs_heuristic_keeps_where_clause_in_signature() {
+        let src = r#"
+pub fn pick_left<T>(left: T, _right: T) -> T
+where
+    T: Copy,
+{
+    left
+}
+"#;
+        let docs = extract_symbol_docs_heuristic(
+            "ws_test",
+            "src/types.rs",
+            "file:///tmp/ws/src/types.rs",
+            src,
+        );
+        let pick_left = docs
+            .iter()
+            .find(|doc| doc.symbol == "pick_left")
+            .expect("pick_left symbol should exist");
+        assert!(pick_left.signature.contains("where"));
+        assert!(pick_left.signature.contains("T: Copy"));
+    }
+
+    #[test]
     fn normalize_crate_root_maps_workspace_root_to_dot() {
         assert_eq!(normalize_crate_root(Path::new("")), ".");
         assert_eq!(normalize_crate_root(Path::new(".")), ".");
@@ -3871,6 +3996,68 @@ pub struct Thing {
         let chunks = symbol_docs_to_chunks(&docs);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_id, "symbol:ws_test:src/lib.rs:fn:add:1:3");
+    }
+
+    #[test]
+    fn canonical_symbol_doc_round_trip_preserves_legacy_shape() {
+        let legacy = RustItemDoc {
+            id: "symbol:ws_test:src/lib.rs:fn:add:1:3".to_string(),
+            kind: "fn".to_string(),
+            symbol: "add".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            workspace_id: "ws_test".to_string(),
+            uri: "file:///tmp/ws/src/lib.rs".to_string(),
+            module: "src::lib".to_string(),
+            symbol_path: "src::lib::add".to_string(),
+            crate_name: "example_crate".to_string(),
+            edition: "2024".to_string(),
+            signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
+            docs: "Adds numbers".to_string(),
+            hover_summary: "hover add".to_string(),
+            body_excerpt: "a + b".to_string(),
+            start_line: 1,
+            start_character: 3,
+            end_line: 3,
+        };
+
+        let canonical = schema::SymbolDoc::from_legacy(&legacy);
+        assert_eq!(canonical.symbol_id_stable, legacy.id);
+        assert!(!canonical.body_hash.is_empty());
+        assert_eq!(canonical.span.file_path, legacy.file_path);
+
+        let back = canonical.to_legacy();
+        assert_eq!(back.id, legacy.id);
+        assert_eq!(back.symbol, legacy.symbol);
+        assert_eq!(back.file_path, legacy.file_path);
+        assert_eq!(back.hover_summary, legacy.hover_summary);
+    }
+
+    #[test]
+    fn canonical_graph_edge_round_trip_preserves_legacy_shape() {
+        let legacy = SymbolRelationDoc {
+            id: "relation:ws_test:implementations:symbol:ws_test:src/lib.rs:trait:Rule:1:1:src/types.rs:4:4".to_string(),
+            workspace_id: "ws_test".to_string(),
+            relation_kind: "implementations".to_string(),
+            source_symbol_id: "symbol:ws_test:src/lib.rs:trait:Rule:1:1".to_string(),
+            source_symbol: "Rule".to_string(),
+            source_file_path: "src/lib.rs".to_string(),
+            source_crate_name: "example_crate".to_string(),
+            source_uri: "file:///tmp/ws/src/lib.rs".to_string(),
+            target_file_path: "src/types.rs".to_string(),
+            target_uri: "file:///tmp/ws/src/types.rs".to_string(),
+            target_start_line: 4,
+            target_end_line: 4,
+            target_excerpt: "impl crate::Rule for PositiveRule {".to_string(),
+        };
+
+        let canonical = schema::GraphEdgeDoc::from_legacy(&legacy);
+        assert_eq!(canonical.edge_type, "impl_to_trait");
+        assert_eq!(canonical.relation_kind, legacy.relation_kind);
+
+        let back = canonical.to_legacy();
+        assert_eq!(back.id, legacy.id);
+        assert_eq!(back.source_symbol_id, legacy.source_symbol_id);
+        assert_eq!(back.target_excerpt, legacy.target_excerpt);
     }
 
     #[test]
@@ -3966,6 +4153,19 @@ pub struct Thing {
         ));
         assert!(!relation_target_is_low_signal(
             "impl Engine {\n    pub fn run(...) -> bool {"
+        ));
+    }
+
+    #[test]
+    fn excerpt_is_impl_for_symbol_detects_impl_blocks() {
+        assert!(excerpt_is_impl_for_symbol(
+            "impl crate::Rule for PositiveRule {",
+            "PositiveRule"
+        ));
+        assert!(excerpt_is_impl_for_symbol("impl Engine {", "Engine"));
+        assert!(!excerpt_is_impl_for_symbol(
+            "let rule = PositiveRule;",
+            "PositiveRule"
         ));
     }
 }

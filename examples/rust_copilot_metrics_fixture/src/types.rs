@@ -27,3 +27,11 @@ pub fn classify(value: i32) -> ValueState {
         ValueState::Zero
     }
 }
+
+/// Minimal generic helper for extraction coverage of generics + where clauses.
+pub fn pick_left<T>(left: T, _right: T) -> T
+where
+    T: Copy,
+{
+    left
+}

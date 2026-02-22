@@ -1,0 +1,54 @@
+{
+  "schema_version": "2026-02-22",
+  "workspace": "examples/rust_copilot_metrics_fixture",
+  "index_status": {
+    "status": {
+      "total_files": 4,
+      "total_chunks": 21,
+      "workspace_crates": 1,
+      "extraction_metrics": {
+        "content_modified_retries_total": 0,
+        "definitions_failed_total": 0,
+        "definitions_nonempty_total": 15,
+        "definitions_success_total": 15,
+        "files_fallback_heuristic_total": 0,
+        "files_reindexed_total": 5,
+        "hover_failed_total": 0,
+        "hover_nonempty_total": 27,
+        "hover_success_total": 27,
+        "implementations_failed_total": 1,
+        "implementations_nonempty_total": 2,
+        "implementations_success_total": 2,
+        "references_failed_total": 0,
+        "references_nonempty_total": 13,
+        "references_success_total": 15,
+        "relations_definitions_emitted_total": 15,
+        "relations_implementations_emitted_total": 2,
+        "relations_indexed_total": 49,
+        "relations_references_emitted_total": 27,
+        "relations_type_definitions_emitted_total": 4,
+        "request_timeouts_total": 1,
+        "symbols_indexed_total": 27,
+        "type_definitions_failed_total": 0,
+        "type_definitions_nonempty_total": 4,
+        "type_definitions_success_total": 4,
+        "workspace_symbol_failed_total": 0,
+        "workspace_symbol_nonempty_total": 0,
+        "workspace_symbol_success_total": 0
+      }
+    }
+  },
+  "qdrant_points": {
+    "rust_copilot_symbols": 21,
+    "rust_copilot_relations": 39,
+    "rust_copilot_metadata": 1
+  },
+  "retrieval_assertions": {
+    "relation_positiverule_implements_rule": {
+      "top_relation_kind": "implementations"
+    },
+    "metadata_workspace_crate": {
+      "root_crate_root": "."
+    }
+  }
+}
