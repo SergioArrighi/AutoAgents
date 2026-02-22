@@ -98,6 +98,16 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 
 - Ingestion is queue-based, with debounce + batch processing for file-change storms.
 - Query plane is read-only and returns `indexing_in_progress`.
+- Search now supports multi-vector semantic fusion by default. If `vector_name` is omitted, the daemon queries multiple named vectors, applies weighted score fusion, and merges by stable id. If `vector_name` is provided, it uses that single channel only (backward-compatible behavior).
+- Default fusion channels:
+  - `search_code`: `symbol` (0.50), `docs` (0.30), `signature` (0.20), plus lexical/semantic hybrid merge.
+  - `search_relations`: `symbol` (0.45), `docs` (0.25), `signature` (0.20), `body` (0.10), then intent-aware reranking.
+  - `search_files`: `symbol` (0.55), `docs` (0.45).
+  - `search_calls`: `symbol` (0.50), `docs` (0.50).
+  - `search_types`: `symbol` (0.45), `docs` (0.55).
+  - `search_diagnostics`: `symbol` (0.50), `docs` (0.50).
+- `explain_relevance` uses the same fused semantic retrieval path (`symbol/docs/signature`) before evidence extraction.
+- MCP responses include `semantic_vector_names` when fused mode is used, and keep `semantic_vector_name` for compatibility.
 - `search_relations` uses semantic retrieval plus intent-aware reranking: query terms like `implements`, `defined`, `references`, and `type definition` boost matching relation kinds.
 - MCP responses now emit canonical schema payloads (`SymbolDoc` / typed graph edge docs).
 - Canonical indexing schema includes `SymbolDoc`, `FileDoc`, typed graph edges, and `DiagnosticDoc`.

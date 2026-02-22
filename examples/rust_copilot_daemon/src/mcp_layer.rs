@@ -215,10 +215,8 @@ async fn handle_mcp_workspace_metadata(app: App) -> Result<Value, RpcError> {
 /// Implements `search_code` using lexical + semantic hybrid ranking.
 async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, req.top_k, 8);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let semantic_samples = (top_k.saturating_mul(4)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
 
     let lexical = lexical_search(
@@ -227,26 +225,25 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
         top_k,
     );
 
-    let semantic = {
+    let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        let request = VectorSearchRequest::builder()
-            .query(req.query.clone())
-            .query_vector_name(vector_name.clone())
-            .samples(top_k as u64)
-            .build()
-            .map_err(|err| RpcError {
-                code: 400,
-                message: format!("invalid search request: {err}"),
-            })?;
-
-        services
-            .store
-            .top_n::<schema::SymbolDoc>(request)
-            .await
-            .map_err(|err| RpcError {
-                code: 500,
-                message: format!("semantic search failed: {err}"),
-            })?
+        semantic_search_fused(
+            &services.store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[
+                (SYMBOL_VECTOR_NAME, 0.50),
+                (DOCS_VECTOR_NAME, 0.30),
+                (SIGNATURE_VECTOR_NAME, 0.20),
+            ],
+            |item: &schema::SymbolDoc| {
+                matches_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "search request",
+            "semantic search failed",
+        )
+        .await?
     };
 
     let mut merged: HashMap<String, (f64, schema::SymbolDoc)> = HashMap::new();
@@ -260,13 +257,11 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
         }
     }
 
-    for (score, _, item) in semantic {
-        if matches_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-            merged
-                .entry(item.id.clone())
-                .and_modify(|entry| entry.0 += score * 0.6)
-                .or_insert((score * 0.6, item));
-        }
+    for (score, item) in semantic {
+        merged
+            .entry(item.id.clone())
+            .and_modify(|entry| entry.0 += score * 0.6)
+            .or_insert((score * 0.6, item));
     }
 
     let mut rows = merged.into_values().collect::<Vec<_>>();
@@ -278,7 +273,8 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "results": rows
             .into_iter()
             .map(|(score, item)| json!({
@@ -295,44 +291,35 @@ async fn handle_mcp_search_relations(
     req: SearchRelationsRequest,
 ) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, req.top_k, 8);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
     let semantic_samples = (top_k.saturating_mul(4)).clamp(top_k, 64);
 
-    let semantic = {
+    let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        let request = VectorSearchRequest::builder()
-            .query(req.query.clone())
-            .query_vector_name(vector_name.clone())
-            .samples(semantic_samples as u64)
-            .build()
-            .map_err(|err| RpcError {
-                code: 400,
-                message: format!("invalid relation search request: {err}"),
-            })?;
-
-        services
-            .relation_store
-            .top_n::<schema::GraphEdgeDoc>(request)
-            .await
-            .map_err(|err| RpcError {
-                code: 500,
-                message: format!("semantic relation search failed: {err}"),
-            })?
+        semantic_search_fused(
+            &services.relation_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[
+                (SYMBOL_VECTOR_NAME, 0.45),
+                (DOCS_VECTOR_NAME, 0.25),
+                (SIGNATURE_VECTOR_NAME, 0.20),
+                (BODY_VECTOR_NAME, 0.10),
+            ],
+            |item: &schema::GraphEdgeDoc| {
+                matches_relation_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "relation search request",
+            "semantic relation search failed",
+        )
+        .await?
     };
 
     let rows = semantic
         .into_iter()
-        .filter_map(|(score, _, item)| {
-            if matches_relation_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-                Some((score, item))
-            } else {
-                None
-            }
-        })
+        .map(|(score, item)| (score, item))
         .collect::<Vec<_>>();
     let rows = rerank_relation_results(&req.query, rows, top_k);
 
@@ -340,7 +327,8 @@ async fn handle_mcp_search_relations(
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "results": rows
             .into_iter()
             .map(|(score, item)| json!({
@@ -354,43 +342,30 @@ async fn handle_mcp_search_relations(
 /// Implements `search_files` over file-level docs.
 async fn handle_mcp_search_files(app: App, req: SearchFilesRequest) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, req.top_k, 8);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
 
-    let semantic = {
+    let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        let request = VectorSearchRequest::builder()
-            .query(req.query.clone())
-            .query_vector_name(vector_name.clone())
-            .samples(top_k as u64)
-            .build()
-            .map_err(|err| RpcError {
-                code: 400,
-                message: format!("invalid file search request: {err}"),
-            })?;
-
-        services
-            .file_store
-            .top_n::<schema::FileDoc>(request)
-            .await
-            .map_err(|err| RpcError {
-                code: 500,
-                message: format!("semantic file search failed: {err}"),
-            })?
+        semantic_search_fused(
+            &services.file_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.55), (DOCS_VECTOR_NAME, 0.45)],
+            |item: &schema::FileDoc| {
+                matches_file_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "file search request",
+            "semantic file search failed",
+        )
+        .await?
     };
 
     let rows = semantic
         .into_iter()
-        .filter_map(|(score, _, item)| {
-            if matches_file_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-                Some((score, item))
-            } else {
-                None
-            }
-        })
+        .map(|(score, item)| (score, item))
         .take(top_k)
         .collect::<Vec<_>>();
 
@@ -398,7 +373,8 @@ async fn handle_mcp_search_files(app: App, req: SearchFilesRequest) -> Result<Va
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "results": rows
             .into_iter()
             .map(|(score, item)| json!({
@@ -412,43 +388,30 @@ async fn handle_mcp_search_files(app: App, req: SearchFilesRequest) -> Result<Va
 /// Implements `search_calls` over typed call edges.
 async fn handle_mcp_search_calls(app: App, req: SearchCallsRequest) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, req.top_k, 8);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
 
-    let semantic = {
+    let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        let request = VectorSearchRequest::builder()
-            .query(req.query.clone())
-            .query_vector_name(vector_name.clone())
-            .samples(top_k as u64)
-            .build()
-            .map_err(|err| RpcError {
-                code: 400,
-                message: format!("invalid call search request: {err}"),
-            })?;
-
-        services
-            .call_edge_store
-            .top_n::<schema::CallEdge>(request)
-            .await
-            .map_err(|err| RpcError {
-                code: 500,
-                message: format!("semantic call search failed: {err}"),
-            })?
+        semantic_search_fused(
+            &services.call_edge_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.50), (DOCS_VECTOR_NAME, 0.50)],
+            |item: &schema::CallEdge| {
+                matches_call_edge_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "call search request",
+            "semantic call search failed",
+        )
+        .await?
     };
 
     let rows = semantic
         .into_iter()
-        .filter_map(|(score, _, item)| {
-            if matches_call_edge_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-                Some((score, item))
-            } else {
-                None
-            }
-        })
+        .map(|(score, item)| (score, item))
         .take(top_k)
         .collect::<Vec<_>>();
 
@@ -456,7 +419,8 @@ async fn handle_mcp_search_calls(app: App, req: SearchCallsRequest) -> Result<Va
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "results": rows
             .into_iter()
             .map(|(score, item)| json!({
@@ -470,43 +434,30 @@ async fn handle_mcp_search_calls(app: App, req: SearchCallsRequest) -> Result<Va
 /// Implements `search_types` over typed type edges.
 async fn handle_mcp_search_types(app: App, req: SearchTypesRequest) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, req.top_k, 8);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
 
-    let semantic = {
+    let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        let request = VectorSearchRequest::builder()
-            .query(req.query.clone())
-            .query_vector_name(vector_name.clone())
-            .samples(top_k as u64)
-            .build()
-            .map_err(|err| RpcError {
-                code: 400,
-                message: format!("invalid type-edge search request: {err}"),
-            })?;
-
-        services
-            .type_edge_store
-            .top_n::<schema::TypeEdge>(request)
-            .await
-            .map_err(|err| RpcError {
-                code: 500,
-                message: format!("semantic type-edge search failed: {err}"),
-            })?
+        semantic_search_fused(
+            &services.type_edge_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.45), (DOCS_VECTOR_NAME, 0.55)],
+            |item: &schema::TypeEdge| {
+                matches_type_edge_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "type-edge search request",
+            "semantic type-edge search failed",
+        )
+        .await?
     };
 
     let rows = semantic
         .into_iter()
-        .filter_map(|(score, _, item)| {
-            if matches_type_edge_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-                Some((score, item))
-            } else {
-                None
-            }
-        })
+        .map(|(score, item)| (score, item))
         .take(top_k)
         .collect::<Vec<_>>();
 
@@ -514,7 +465,8 @@ async fn handle_mcp_search_types(app: App, req: SearchTypesRequest) -> Result<Va
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "results": rows
             .into_iter()
             .map(|(score, item)| json!({
@@ -531,43 +483,30 @@ async fn handle_mcp_search_diagnostics(
     req: SearchDiagnosticsRequest,
 ) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, req.top_k, 8);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
 
-    let semantic = {
+    let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        let request = VectorSearchRequest::builder()
-            .query(req.query.clone())
-            .query_vector_name(vector_name.clone())
-            .samples(top_k as u64)
-            .build()
-            .map_err(|err| RpcError {
-                code: 400,
-                message: format!("invalid diagnostic search request: {err}"),
-            })?;
-
-        services
-            .diagnostic_store
-            .top_n::<schema::DiagnosticDoc>(request)
-            .await
-            .map_err(|err| RpcError {
-                code: 500,
-                message: format!("semantic diagnostic search failed: {err}"),
-            })?
+        semantic_search_fused(
+            &services.diagnostic_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.50), (DOCS_VECTOR_NAME, 0.50)],
+            |item: &schema::DiagnosticDoc| {
+                matches_diagnostic_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "diagnostic search request",
+            "semantic diagnostic search failed",
+        )
+        .await?
     };
 
     let rows = semantic
         .into_iter()
-        .filter_map(|(score, _, item)| {
-            if matches_diagnostic_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-                Some((score, item))
-            } else {
-                None
-            }
-        })
+        .map(|(score, item)| (score, item))
         .take(top_k)
         .collect::<Vec<_>>();
 
@@ -575,7 +514,8 @@ async fn handle_mcp_search_diagnostics(
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "results": rows
             .into_iter()
             .map(|(score, item)| json!({
@@ -617,6 +557,104 @@ pub(super) fn lexical_search(
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(top_k);
     scored
+}
+
+fn normalize_channel_weights(channels: &[(&str, f64)]) -> Vec<(String, f64)> {
+    let positive_total = channels
+        .iter()
+        .filter_map(|(_, weight)| (*weight > 0.0).then_some(*weight))
+        .sum::<f64>();
+
+    if positive_total > 0.0 {
+        return channels
+            .iter()
+            .filter_map(|(name, weight)| {
+                (*weight > 0.0).then_some(((*name).to_string(), *weight / positive_total))
+            })
+            .collect::<Vec<_>>();
+    }
+
+    if channels.is_empty() {
+        return Vec::new();
+    }
+
+    let default = 1.0 / channels.len() as f64;
+    channels
+        .iter()
+        .map(|(name, _)| ((*name).to_string(), default))
+        .collect::<Vec<_>>()
+}
+
+async fn semantic_search_fused<T, F>(
+    store: &QdrantVectorStore,
+    query: &str,
+    vector_name_override: Option<&str>,
+    samples: usize,
+    channels: &[(&str, f64)],
+    keep: F,
+    invalid_request_context: &str,
+    search_failure_context: &str,
+) -> Result<(Vec<(f64, T)>, Vec<String>), RpcError>
+where
+    T: for<'de> Deserialize<'de> + Send + Sync + Clone,
+    F: Fn(&T) -> bool,
+{
+    if let Some(vector_name) = vector_name_override {
+        let request = VectorSearchRequest::builder()
+            .query(query.to_string())
+            .query_vector_name(vector_name.to_string())
+            .samples(samples as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid {invalid_request_context}: {err}"),
+            })?;
+
+        let rows = store.top_n::<T>(request).await.map_err(|err| RpcError {
+            code: 500,
+            message: format!("{search_failure_context}: {err}"),
+        })?;
+
+        let filtered = rows
+            .into_iter()
+            .filter_map(|(score, _, item)| keep(&item).then_some((score, item)))
+            .collect::<Vec<_>>();
+        return Ok((filtered, vec![vector_name.to_string()]));
+    }
+
+    let normalized = normalize_channel_weights(channels);
+    let mut merged: HashMap<String, (f64, T)> = HashMap::new();
+    let mut used_vectors = Vec::<String>::new();
+
+    for (vector_name, weight) in normalized {
+        let request = VectorSearchRequest::builder()
+            .query(query.to_string())
+            .query_vector_name(vector_name.clone())
+            .samples(samples as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid {invalid_request_context}: {err}"),
+            })?;
+
+        let rows = store.top_n::<T>(request).await.map_err(|err| RpcError {
+            code: 500,
+            message: format!("{search_failure_context}: {err}"),
+        })?;
+        used_vectors.push(vector_name);
+
+        for (score, id, item) in rows {
+            if !keep(&item) {
+                continue;
+            }
+            let entry = merged.entry(id).or_insert_with(|| (0.0, item));
+            entry.0 += score * weight;
+        }
+    }
+
+    let mut rows = merged.into_values().collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok((rows, used_vectors))
 }
 
 fn resolve_limit(limit: Option<usize>, top_k: Option<usize>, default: usize) -> usize {
@@ -1568,13 +1606,12 @@ async fn handle_mcp_explain_relevance(
 ) -> Result<Value, RpcError> {
     let top_k = resolve_limit(req.limit, None, 5);
     let score_threshold = req.score_threshold.unwrap_or(1.2).max(0.0);
-    let vector_name = req
-        .vector_name
-        .clone()
-        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let semantic_samples = (top_k.saturating_mul(4)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
     let default_workspace_id = app.config.read().await.workspace_id.clone();
 
     let mut candidate_scores: HashMap<String, f64> = HashMap::new();
+    let mut used_semantic_vectors = Vec::<String>::new();
     let resolved_point_ids =
         if let Some(point_ids) = req.point_ids.clone().filter(|ids| !ids.is_empty()) {
             point_ids
@@ -1585,27 +1622,27 @@ async fn handle_mcp_explain_relevance(
                 top_k,
             );
 
-            let semantic = {
+            let (semantic, vectors) = {
                 let services = app.services.read().await.clone();
-                let request = VectorSearchRequest::builder()
-                    .query(req.query.clone())
-                    .query_vector_name(vector_name.clone())
-                    .samples(top_k as u64)
-                    .build()
-                    .map_err(|err| RpcError {
-                        code: 400,
-                        message: format!("invalid explain request: {err}"),
-                    })?;
-
-                services
-                    .store
-                    .top_n::<schema::SymbolDoc>(request)
-                    .await
-                    .map_err(|err| RpcError {
-                        code: 500,
-                        message: format!("semantic explain search failed: {err}"),
-                    })?
+                semantic_search_fused(
+                    &services.store,
+                    &req.query,
+                    vector_name.as_deref(),
+                    semantic_samples,
+                    &[
+                        (SYMBOL_VECTOR_NAME, 0.50),
+                        (DOCS_VECTOR_NAME, 0.30),
+                        (SIGNATURE_VECTOR_NAME, 0.20),
+                    ],
+                    |item: &schema::SymbolDoc| {
+                        matches_filters(item, req.filters.as_ref(), &default_workspace_id)
+                    },
+                    "explain request",
+                    "semantic explain search failed",
+                )
+                .await?
             };
+            used_semantic_vectors = vectors;
 
             let mut merged: HashMap<String, (f64, schema::SymbolDoc)> = HashMap::new();
 
@@ -1618,13 +1655,11 @@ async fn handle_mcp_explain_relevance(
                 }
             }
 
-            for (score, _, item) in semantic {
-                if matches_filters(&item, req.filters.as_ref(), &default_workspace_id) {
-                    merged
-                        .entry(item.id.clone())
-                        .and_modify(|entry| entry.0 += score * 0.6)
-                        .or_insert((score * 0.6, item));
-                }
+            for (score, item) in semantic {
+                merged
+                    .entry(item.id.clone())
+                    .and_modify(|entry| entry.0 += score * 0.6)
+                    .or_insert((score * 0.6, item));
             }
 
             let mut rows = merged.into_values().collect::<Vec<_>>();
@@ -1678,7 +1713,8 @@ async fn handle_mcp_explain_relevance(
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "indexing_in_progress": state.indexing_in_progress,
-        "semantic_vector_name": vector_name,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
         "score_threshold": score_threshold,
         "resolved_point_ids": resolved_point_ids,
         "explanation": explanations,
