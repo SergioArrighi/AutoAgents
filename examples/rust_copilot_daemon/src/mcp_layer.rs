@@ -81,8 +81,13 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
             "tools": [
                 "search_code",
                 "search_relations",
+                "search_files",
+                "search_calls",
+                "search_types",
+                "search_diagnostics",
                 "workspace_metadata",
                 "get_file_chunks",
+                "get_file_context",
                 "get_symbol_context",
                 "get_symbol_relations",
                 "explain_relevance",
@@ -101,9 +106,33 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
                 Err(err) => Err(err),
             }
         }
+        ("POST", "/mcp/tools/search_files") => match parse_json_body::<SearchFilesRequest>(body) {
+            Ok(req) => handle_mcp_search_files(app, req).await,
+            Err(err) => Err(err),
+        },
+        ("POST", "/mcp/tools/search_calls") => match parse_json_body::<SearchCallsRequest>(body) {
+            Ok(req) => handle_mcp_search_calls(app, req).await,
+            Err(err) => Err(err),
+        },
+        ("POST", "/mcp/tools/search_types") => match parse_json_body::<SearchTypesRequest>(body) {
+            Ok(req) => handle_mcp_search_types(app, req).await,
+            Err(err) => Err(err),
+        },
+        ("POST", "/mcp/tools/search_diagnostics") => {
+            match parse_json_body::<SearchDiagnosticsRequest>(body) {
+                Ok(req) => handle_mcp_search_diagnostics(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
         ("POST", "/mcp/tools/get_file_chunks") => {
             match parse_json_body::<GetFileChunksRequest>(body) {
                 Ok(req) => handle_mcp_get_file_chunks(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
+        ("POST", "/mcp/tools/get_file_context") => {
+            match parse_json_body::<FileContextRequest>(body) {
+                Ok(req) => handle_mcp_get_file_context(app, req).await,
                 Err(err) => Err(err),
             }
         }
@@ -212,7 +241,7 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
 
         services
             .store
-            .top_n::<RustItemDoc>(request)
+            .top_n::<schema::SymbolDoc>(request)
             .await
             .map_err(|err| RpcError {
                 code: 500,
@@ -220,7 +249,7 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
             })?
     };
 
-    let mut merged: HashMap<String, (f64, RustItemDoc)> = HashMap::new();
+    let mut merged: HashMap<String, (f64, schema::SymbolDoc)> = HashMap::new();
 
     for (score, item) in lexical {
         if matches_filters(&item, req.filters.as_ref(), &default_workspace_id) {
@@ -287,7 +316,7 @@ async fn handle_mcp_search_relations(
 
         services
             .relation_store
-            .top_n::<SymbolRelationDoc>(request)
+            .top_n::<schema::GraphEdgeDoc>(request)
             .await
             .map_err(|err| RpcError {
                 code: 500,
@@ -322,12 +351,247 @@ async fn handle_mcp_search_relations(
     }))
 }
 
+/// Implements `search_files` over file-level docs.
+async fn handle_mcp_search_files(app: App, req: SearchFilesRequest) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let vector_name = req
+        .vector_name
+        .clone()
+        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let semantic = {
+        let services = app.services.read().await.clone();
+        let request = VectorSearchRequest::builder()
+            .query(req.query.clone())
+            .query_vector_name(vector_name.clone())
+            .samples(top_k as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid file search request: {err}"),
+            })?;
+
+        services
+            .file_store
+            .top_n::<schema::FileDoc>(request)
+            .await
+            .map_err(|err| RpcError {
+                code: 500,
+                message: format!("semantic file search failed: {err}"),
+            })?
+    };
+
+    let rows = semantic
+        .into_iter()
+        .filter_map(|(score, _, item)| {
+            if matches_file_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                Some((score, item))
+            } else {
+                None
+            }
+        })
+        .take(top_k)
+        .collect::<Vec<_>>();
+
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_file_doc(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Implements `search_calls` over typed call edges.
+async fn handle_mcp_search_calls(app: App, req: SearchCallsRequest) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let vector_name = req
+        .vector_name
+        .clone()
+        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let semantic = {
+        let services = app.services.read().await.clone();
+        let request = VectorSearchRequest::builder()
+            .query(req.query.clone())
+            .query_vector_name(vector_name.clone())
+            .samples(top_k as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid call search request: {err}"),
+            })?;
+
+        services
+            .call_edge_store
+            .top_n::<schema::CallEdge>(request)
+            .await
+            .map_err(|err| RpcError {
+                code: 500,
+                message: format!("semantic call search failed: {err}"),
+            })?
+    };
+
+    let rows = semantic
+        .into_iter()
+        .filter_map(|(score, _, item)| {
+            if matches_call_edge_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                Some((score, item))
+            } else {
+                None
+            }
+        })
+        .take(top_k)
+        .collect::<Vec<_>>();
+
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_call_edge(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Implements `search_types` over typed type edges.
+async fn handle_mcp_search_types(app: App, req: SearchTypesRequest) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let vector_name = req
+        .vector_name
+        .clone()
+        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let semantic = {
+        let services = app.services.read().await.clone();
+        let request = VectorSearchRequest::builder()
+            .query(req.query.clone())
+            .query_vector_name(vector_name.clone())
+            .samples(top_k as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid type-edge search request: {err}"),
+            })?;
+
+        services
+            .type_edge_store
+            .top_n::<schema::TypeEdge>(request)
+            .await
+            .map_err(|err| RpcError {
+                code: 500,
+                message: format!("semantic type-edge search failed: {err}"),
+            })?
+    };
+
+    let rows = semantic
+        .into_iter()
+        .filter_map(|(score, _, item)| {
+            if matches_type_edge_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                Some((score, item))
+            } else {
+                None
+            }
+        })
+        .take(top_k)
+        .collect::<Vec<_>>();
+
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_type_edge(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Implements `search_diagnostics` over extracted diagnostics.
+async fn handle_mcp_search_diagnostics(
+    app: App,
+    req: SearchDiagnosticsRequest,
+) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let vector_name = req
+        .vector_name
+        .clone()
+        .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let semantic = {
+        let services = app.services.read().await.clone();
+        let request = VectorSearchRequest::builder()
+            .query(req.query.clone())
+            .query_vector_name(vector_name.clone())
+            .samples(top_k as u64)
+            .build()
+            .map_err(|err| RpcError {
+                code: 400,
+                message: format!("invalid diagnostic search request: {err}"),
+            })?;
+
+        services
+            .diagnostic_store
+            .top_n::<schema::DiagnosticDoc>(request)
+            .await
+            .map_err(|err| RpcError {
+                code: 500,
+                message: format!("semantic diagnostic search failed: {err}"),
+            })?
+    };
+
+    let rows = semantic
+        .into_iter()
+        .filter_map(|(score, _, item)| {
+            if matches_diagnostic_filters(&item, req.filters.as_ref(), &default_workspace_id) {
+                Some((score, item))
+            } else {
+                None
+            }
+        })
+        .take(top_k)
+        .collect::<Vec<_>>();
+
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_diagnostic_doc(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 /// Lexical scoring component used by `search_code`.
 pub(super) fn lexical_search(
-    items_by_file: HashMap<String, Vec<RustItemDoc>>,
+    items_by_file: HashMap<String, Vec<schema::SymbolDoc>>,
     query: &str,
     top_k: usize,
-) -> Vec<(f64, RustItemDoc)> {
+) -> Vec<(f64, schema::SymbolDoc)> {
     let tokens: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
@@ -359,19 +623,35 @@ fn resolve_limit(limit: Option<usize>, top_k: Option<usize>, default: usize) -> 
     limit.or(top_k).unwrap_or(default).max(1)
 }
 
-fn canonical_symbol_doc(item: &RustItemDoc) -> schema::SymbolDoc {
-    schema::SymbolDoc::from_legacy(item)
+fn canonical_symbol_doc(item: &schema::SymbolDoc) -> schema::SymbolDoc {
+    item.clone()
 }
 
-fn canonical_relation_doc(item: &SymbolRelationDoc) -> schema::GraphEdgeDoc {
-    schema::GraphEdgeDoc::from_legacy(item)
+fn canonical_relation_doc(item: &schema::GraphEdgeDoc) -> schema::GraphEdgeDoc {
+    item.clone()
+}
+
+fn canonical_file_doc(item: &schema::FileDoc) -> schema::FileDoc {
+    item.clone()
+}
+
+fn canonical_call_edge(item: &schema::CallEdge) -> schema::CallEdge {
+    item.clone()
+}
+
+fn canonical_type_edge(item: &schema::TypeEdge) -> schema::TypeEdge {
+    item.clone()
+}
+
+fn canonical_diagnostic_doc(item: &schema::DiagnosticDoc) -> schema::DiagnosticDoc {
+    item.clone()
 }
 
 fn rerank_relation_results(
     query: &str,
-    mut rows: Vec<(f64, SymbolRelationDoc)>,
+    mut rows: Vec<(f64, schema::GraphEdgeDoc)>,
     top_k: usize,
-) -> Vec<(f64, SymbolRelationDoc)> {
+) -> Vec<(f64, schema::GraphEdgeDoc)> {
     let intent_kind = infer_relation_intent_kind(query);
     let query_tokens = query_tokens(query);
 
@@ -390,7 +670,7 @@ fn rerank_relation_results(
 
 fn relation_relevance_score(
     base_score: f64,
-    item: &SymbolRelationDoc,
+    item: &schema::GraphEdgeDoc,
     intent_kind: Option<&'static str>,
     query_tokens: &HashSet<String>,
 ) -> f64 {
@@ -453,7 +733,7 @@ fn query_tokens(query: &str) -> HashSet<String> {
         .collect::<HashSet<_>>()
 }
 
-fn source_symbol_token_overlap(item: &SymbolRelationDoc, query_tokens: &HashSet<String>) -> bool {
+fn source_symbol_token_overlap(item: &schema::GraphEdgeDoc, query_tokens: &HashSet<String>) -> bool {
     if query_tokens.is_empty() {
         return false;
     }
@@ -466,7 +746,7 @@ fn source_symbol_token_overlap(item: &SymbolRelationDoc, query_tokens: &HashSet<
 
 /// Applies optional search filters to a chunk.
 fn matches_filters(
-    item: &RustItemDoc,
+    item: &schema::SymbolDoc,
     filters: Option<&SearchFilters>,
     default_workspace_id: &str,
 ) -> bool {
@@ -497,7 +777,7 @@ fn matches_filters(
 }
 
 fn matches_relation_filters(
-    item: &SymbolRelationDoc,
+    item: &schema::GraphEdgeDoc,
     filters: Option<&RelationSearchFilters>,
     default_workspace_id: &str,
 ) -> bool {
@@ -529,6 +809,235 @@ fn matches_relation_filters(
     }
 
     true
+}
+
+fn matches_file_filters(
+    item: &schema::FileDoc,
+    filters: Option<&FileSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(file_path) = &filters.file_path
+        && !item.file_path.contains(file_path)
+    {
+        return false;
+    }
+    if let Some(module) = &filters.module
+        && !item.module.contains(module)
+    {
+        return false;
+    }
+    if let Some(crate_name) = &filters.crate_name
+        && item.crate_name != *crate_name
+    {
+        return false;
+    }
+    true
+}
+
+fn matches_call_edge_filters(
+    item: &schema::CallEdge,
+    filters: Option<&CallEdgeSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(source_file_path) = &filters.source_file_path
+        && !item.source_span.file_path.contains(source_file_path)
+    {
+        return false;
+    }
+    if let Some(target_file_path) = &filters.target_file_path
+        && !item.target_span.file_path.contains(target_file_path)
+    {
+        return false;
+    }
+    if let Some(source_symbol_id) = &filters.source_symbol_id
+        && item.source_symbol_id != *source_symbol_id
+    {
+        return false;
+    }
+    if let Some(target_symbol_id) = &filters.target_symbol_id
+        && item.target_symbol_id != *target_symbol_id
+    {
+        return false;
+    }
+    true
+}
+
+fn matches_type_edge_filters(
+    item: &schema::TypeEdge,
+    filters: Option<&TypeEdgeSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(relation_kind) = &filters.relation_kind
+        && item.relation_kind != *relation_kind
+    {
+        return false;
+    }
+    if let Some(source_file_path) = &filters.source_file_path
+        && !item.source_span.file_path.contains(source_file_path)
+    {
+        return false;
+    }
+    if let Some(target_file_path) = &filters.target_file_path
+        && !item.target_span.file_path.contains(target_file_path)
+    {
+        return false;
+    }
+    if let Some(source_symbol_id) = &filters.source_symbol_id
+        && item.source_symbol_id != *source_symbol_id
+    {
+        return false;
+    }
+    if let Some(target_symbol_id) = &filters.target_symbol_id
+        && item.target_symbol_id != *target_symbol_id
+    {
+        return false;
+    }
+    true
+}
+
+fn matches_diagnostic_filters(
+    item: &schema::DiagnosticDoc,
+    filters: Option<&DiagnosticSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(file_path) = &filters.file_path
+        && !item.file_path.contains(file_path)
+    {
+        return false;
+    }
+    if let Some(severity) = &filters.severity
+        && item.severity != *severity
+    {
+        return false;
+    }
+    if let Some(code) = &filters.code
+        && item.code.as_deref() != Some(code.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+/// Implements `get_file_context` tool.
+async fn handle_mcp_get_file_context(app: App, req: FileContextRequest) -> Result<Value, RpcError> {
+    let limit = req.limit.unwrap_or(16).max(1);
+    let state = app.state.read().await;
+
+    let file_doc = state
+        .file_docs_by_file
+        .get(&req.file_path)
+        .map(canonical_file_doc);
+    let symbols = state
+        .rust_items_by_file
+        .get(&req.file_path)
+        .map(|items| {
+            items
+                .iter()
+                .take(limit)
+                .map(canonical_symbol_doc)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let relations = state
+        .relations_by_file
+        .get(&req.file_path)
+        .map(|items| {
+            items
+                .iter()
+                .take(limit)
+                .map(canonical_relation_doc)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let call_edges = state
+        .call_edges_by_file
+        .get(&req.file_path)
+        .map(|items| {
+            items
+                .iter()
+                .take(limit)
+                .map(canonical_call_edge)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let type_edges = state
+        .type_edges_by_file
+        .get(&req.file_path)
+        .map(|items| {
+            items
+                .iter()
+                .take(limit)
+                .map(canonical_type_edge)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let diagnostics = state
+        .diagnostics_by_file
+        .get(&req.file_path)
+        .map(|items| {
+            items
+                .iter()
+                .take(limit)
+                .map(canonical_diagnostic_doc)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "file_path": req.file_path,
+        "file_doc": file_doc,
+        "symbols": symbols,
+        "relations": relations,
+        "call_edges": call_edges,
+        "type_edges": type_edges,
+        "diagnostics": diagnostics,
+    }))
 }
 
 /// Implements `get_file_chunks` tool.
@@ -732,7 +1241,7 @@ async fn handle_mcp_get_symbol_relations(
     }))
 }
 
-fn relation_matches_symbol(item: &SymbolRelationDoc, query: &str) -> bool {
+fn relation_matches_symbol(item: &schema::GraphEdgeDoc, query: &str) -> bool {
     let query = query.trim();
     if query.is_empty() {
         return false;
@@ -815,7 +1324,7 @@ fn is_low_signal_query_term(token: &str) -> bool {
 
 fn compute_query_term_idf<'a>(
     terms: &[String],
-    corpus: impl IntoIterator<Item = &'a RustItemDoc>,
+    corpus: impl IntoIterator<Item = &'a schema::SymbolDoc>,
 ) -> HashMap<String, f64> {
     let corpus_docs = corpus.into_iter().collect::<Vec<_>>();
     let n = corpus_docs.len() as f64;
@@ -838,7 +1347,7 @@ fn compute_query_term_idf<'a>(
 }
 
 fn explain_term_evidence(
-    item: &RustItemDoc,
+    item: &schema::SymbolDoc,
     terms: &[String],
     term_idf: &HashMap<String, f64>,
     score_threshold: f64,
@@ -907,11 +1416,12 @@ fn explain_term_evidence(
 mod tests {
     use super::*;
 
-    fn relation_doc(source_symbol: &str, source_symbol_id: &str) -> SymbolRelationDoc {
-        SymbolRelationDoc {
+    fn relation_doc(source_symbol: &str, source_symbol_id: &str) -> schema::GraphEdgeDoc {
+        schema::GraphEdgeDoc {
             id: "relation:test".to_string(),
             workspace_id: "ws_test".to_string(),
             relation_kind: "references".to_string(),
+            edge_type: "symbol_reference".to_string(),
             source_symbol_id: source_symbol_id.to_string(),
             source_symbol: source_symbol.to_string(),
             source_file_path: "src/lib.rs".to_string(),
@@ -963,8 +1473,8 @@ mod tests {
         assert!(kept.contains(&"positiverule".to_string()));
     }
 
-    fn sample_doc(id: &str, symbol: &str, signature: &str, body_excerpt: &str) -> RustItemDoc {
-        RustItemDoc {
+    fn sample_doc(id: &str, symbol: &str, signature: &str, body_excerpt: &str) -> schema::SymbolDoc {
+        schema::SymbolDoc {
             id: id.to_string(),
             kind: "fn".to_string(),
             symbol: symbol.to_string(),
@@ -982,6 +1492,18 @@ mod tests {
             start_line: 1,
             start_character: 0,
             end_line: 1,
+            span: schema::Span::default(),
+            visibility: None,
+            generics: None,
+            where_clause: None,
+            receiver: None,
+            return_type: None,
+            attrs: Vec::new(),
+            cfgs: Vec::new(),
+            deprecated: false,
+            stability: None,
+            body_hash: String::new(),
+            symbol_id_stable: id.to_string(),
         }
     }
 
@@ -1077,7 +1599,7 @@ async fn handle_mcp_explain_relevance(
 
                 services
                     .store
-                    .top_n::<RustItemDoc>(request)
+                    .top_n::<schema::SymbolDoc>(request)
                     .await
                     .map_err(|err| RpcError {
                         code: 500,
@@ -1085,7 +1607,7 @@ async fn handle_mcp_explain_relevance(
                     })?
             };
 
-            let mut merged: HashMap<String, (f64, RustItemDoc)> = HashMap::new();
+            let mut merged: HashMap<String, (f64, schema::SymbolDoc)> = HashMap::new();
 
             for (score, item) in lexical {
                 if matches_filters(&item, req.filters.as_ref(), &default_workspace_id) {

@@ -128,6 +128,21 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         if let Some(relation_collection) = params.relation_collection {
             cfg.qdrant_relation_collection = relation_collection;
         }
+        if let Some(metadata_collection) = params.metadata_collection {
+            cfg.qdrant_metadata_collection = metadata_collection;
+        }
+        if let Some(file_collection) = params.file_collection {
+            cfg.qdrant_file_collection = file_collection;
+        }
+        if let Some(call_edge_collection) = params.call_edge_collection {
+            cfg.qdrant_call_edge_collection = call_edge_collection;
+        }
+        if let Some(type_edge_collection) = params.type_edge_collection {
+            cfg.qdrant_type_edge_collection = type_edge_collection;
+        }
+        if let Some(diagnostic_collection) = params.diagnostic_collection {
+            cfg.qdrant_diagnostic_collection = diagnostic_collection;
+        }
         if let Some(config) = params.config {
             if let Some(v) = config.ollama_base_url {
                 cfg.ollama_base_url = v;
@@ -167,8 +182,16 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         state.rust_items_by_file.clear();
         state.relations_by_file.clear();
         state.chunks_by_file.clear();
+        state.file_docs_by_file.clear();
+        state.call_edges_by_file.clear();
+        state.type_edges_by_file.clear();
+        state.diagnostics_by_file.clear();
         state.indexed_ids_by_file.clear();
         state.indexed_relation_ids_by_file.clear();
+        state.indexed_file_doc_ids_by_file.clear();
+        state.indexed_call_edge_ids_by_file.clear();
+        state.indexed_type_edge_ids_by_file.clear();
+        state.indexed_diagnostic_ids_by_file.clear();
         state.workspace_metadata = None;
         state.metadata_docs_by_crate.clear();
         state.indexed_metadata_ids.clear();

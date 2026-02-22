@@ -12,9 +12,6 @@ pub(crate) struct Span {
 }
 
 /// Canonical symbol schema.
-///
-/// Compatibility: legacy `RustItemDoc` fields are kept at top level so existing
-/// readers can deserialize this payload without changes.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct SymbolDoc {
     pub(crate) id: String,
@@ -61,73 +58,22 @@ pub(crate) struct SymbolDoc {
 }
 
 impl SymbolDoc {
-    pub(crate) fn from_legacy(item: &crate::RustItemDoc) -> Self {
-        let visibility = infer_visibility(&item.signature);
-        let generics = infer_generics(&item.signature, &item.symbol);
-        let where_clause = infer_where_clause(&item.signature);
-        let receiver = infer_receiver(&item.signature);
-        let return_type = infer_return_type(&item.signature);
-        Self {
-            id: item.id.clone(),
-            kind: item.kind.clone(),
-            symbol: item.symbol.clone(),
-            file_path: item.file_path.clone(),
-            workspace_id: item.workspace_id.clone(),
-            uri: item.uri.clone(),
-            module: item.module.clone(),
-            symbol_path: item.symbol_path.clone(),
-            crate_name: item.crate_name.clone(),
-            edition: item.edition.clone(),
-            signature: item.signature.clone(),
-            docs: item.docs.clone(),
-            hover_summary: item.hover_summary.clone(),
-            body_excerpt: item.body_excerpt.clone(),
-            start_line: item.start_line,
-            start_character: item.start_character,
-            end_line: item.end_line,
-            span: Span {
-                file_path: item.file_path.clone(),
-                uri: item.uri.clone(),
-                start_line: item.start_line,
-                start_character: item.start_character,
-                end_line: item.end_line,
-                end_character: None,
-            },
-            visibility,
-            generics,
-            where_clause,
-            receiver,
-            return_type,
-            attrs: Vec::new(),
-            cfgs: Vec::new(),
-            deprecated: false,
-            stability: None,
-            body_hash: crate::simple_hash(&item.body_excerpt),
-            symbol_id_stable: item.id.clone(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn to_legacy(&self) -> crate::RustItemDoc {
-        crate::RustItemDoc {
-            id: self.id.clone(),
-            kind: self.kind.clone(),
-            symbol: self.symbol.clone(),
+    pub(crate) fn finalize_derived_fields(&mut self) {
+        self.span = Span {
             file_path: self.file_path.clone(),
-            workspace_id: self.workspace_id.clone(),
             uri: self.uri.clone(),
-            module: self.module.clone(),
-            symbol_path: self.symbol_path.clone(),
-            crate_name: self.crate_name.clone(),
-            edition: self.edition.clone(),
-            signature: self.signature.clone(),
-            docs: self.docs.clone(),
-            hover_summary: self.hover_summary.clone(),
-            body_excerpt: self.body_excerpt.clone(),
             start_line: self.start_line,
             start_character: self.start_character,
             end_line: self.end_line,
-        }
+            end_character: None,
+        };
+        self.visibility = infer_visibility(&self.signature);
+        self.generics = infer_generics(&self.signature, &self.symbol);
+        self.where_clause = infer_where_clause(&self.signature);
+        self.receiver = infer_receiver(&self.signature);
+        self.return_type = infer_return_type(&self.signature);
+        self.body_hash = crate::simple_hash(&self.body_excerpt);
+        self.symbol_id_stable = self.id.clone();
     }
 }
 
@@ -217,9 +163,6 @@ fn infer_return_type(signature: &str) -> Option<String> {
 }
 
 /// Canonical typed graph edge.
-///
-/// Compatibility: legacy `SymbolRelationDoc` fields are kept at top level so
-/// existing readers can deserialize this payload without changes.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct GraphEdgeDoc {
     pub(crate) id: String,
@@ -239,53 +182,17 @@ pub(crate) struct GraphEdgeDoc {
 }
 
 impl GraphEdgeDoc {
-    pub(crate) fn from_legacy(item: &crate::SymbolRelationDoc) -> Self {
-        let edge_type = match item.relation_kind.as_str() {
+    pub(crate) fn edge_type_for_relation_kind(relation_kind: &str) -> &'static str {
+        match relation_kind {
             "references" => "symbol_reference",
             "implementations" => "impl_to_trait",
             "definitions" => "definition",
             "type_definitions" => "type_usage",
             _ => "other",
-        };
-        Self {
-            id: item.id.clone(),
-            workspace_id: item.workspace_id.clone(),
-            relation_kind: item.relation_kind.clone(),
-            edge_type: edge_type.to_string(),
-            source_symbol_id: item.source_symbol_id.clone(),
-            source_symbol: item.source_symbol.clone(),
-            source_file_path: item.source_file_path.clone(),
-            source_crate_name: item.source_crate_name.clone(),
-            source_uri: item.source_uri.clone(),
-            target_file_path: item.target_file_path.clone(),
-            target_uri: item.target_uri.clone(),
-            target_start_line: item.target_start_line,
-            target_end_line: item.target_end_line,
-            target_excerpt: item.target_excerpt.clone(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn to_legacy(&self) -> crate::SymbolRelationDoc {
-        crate::SymbolRelationDoc {
-            id: self.id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            relation_kind: self.relation_kind.clone(),
-            source_symbol_id: self.source_symbol_id.clone(),
-            source_symbol: self.source_symbol.clone(),
-            source_file_path: self.source_file_path.clone(),
-            source_crate_name: self.source_crate_name.clone(),
-            source_uri: self.source_uri.clone(),
-            target_file_path: self.target_file_path.clone(),
-            target_uri: self.target_uri.clone(),
-            target_start_line: self.target_start_line,
-            target_end_line: self.target_end_line,
-            target_excerpt: self.target_excerpt.clone(),
         }
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct FileDoc {
     pub(crate) id: String,
@@ -297,7 +204,6 @@ pub(crate) struct FileDoc {
     pub(crate) body_hash: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct CallEdge {
     pub(crate) id: String,
@@ -308,7 +214,6 @@ pub(crate) struct CallEdge {
     pub(crate) target_span: Span,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct TypeEdge {
     pub(crate) id: String,
@@ -320,7 +225,6 @@ pub(crate) struct TypeEdge {
     pub(crate) target_span: Span,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct DiagnosticDoc {
     pub(crate) id: String,

@@ -55,7 +55,7 @@ rust-copilot-daemon started: jsonrpc=stdio mcp=http://127.0.0.1:43891 schema_ver
 
 Input format: newline-delimited JSON-RPC 2.0 requests.
 
-- `initialize({ workspaceRoot, qdrantUrl, collection, config })`
+- `initialize({ workspaceRoot, qdrantUrl, collection, relationCollection?, metadataCollection?, fileCollection?, callEdgeCollection?, typeEdgeCollection?, diagnosticCollection?, config })`
 - `scan.full({ globs, exclude, respectGitignore })`
 - `file.changed({ path, version?, reason? })`
 - `file.deleted({ path })`
@@ -76,7 +76,12 @@ Example:
 - `GET /mcp/tools/workspace_metadata`
 - `POST /mcp/tools/search_code`
 - `POST /mcp/tools/search_relations`
+- `POST /mcp/tools/search_files`
+- `POST /mcp/tools/search_calls`
+- `POST /mcp/tools/search_types`
+- `POST /mcp/tools/search_diagnostics`
 - `POST /mcp/tools/get_file_chunks`
+- `POST /mcp/tools/get_file_context`
 - `POST /mcp/tools/get_symbol_context`
 - `POST /mcp/tools/get_symbol_relations`
 - `POST /mcp/tools/explain_relevance`
@@ -108,7 +113,7 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 
 ## Current limitation
 
-Type-level graph edges (`typeDefinition`, call hierarchy, trait bounds graph) are not yet persisted as dedicated relation documents.
+Graph neighborhood expansion and edge-traversal ranking are not yet exposed as first-class query controls.
 
 ## Retrieval Eval Contract
 

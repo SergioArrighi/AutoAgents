@@ -30,7 +30,8 @@ This document defines the retrieval quality contract for
 3. Index completeness:
    - `total_files`, `total_chunks`, and `workspace_crates` match the fixture contract.
    - Qdrant point counts for `rust_copilot_symbols`, `rust_copilot_relations`,
-     `rust_copilot_metadata` match the fixture contract.
+     `rust_copilot_metadata`, `rust_copilot_files`, `rust_copilot_calls`,
+     `rust_copilot_types`, and `rust_copilot_diagnostics` match the fixture contract.
 
 ## Latency Budgets (Local Dev)
 

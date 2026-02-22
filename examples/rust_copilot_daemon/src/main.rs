@@ -56,6 +56,14 @@ struct RuntimeConfig {
     qdrant_relation_collection: String,
     /// Qdrant collection name for workspace crate metadata.
     qdrant_metadata_collection: String,
+    /// Qdrant collection name for file-level documents.
+    qdrant_file_collection: String,
+    /// Qdrant collection name for typed call edges.
+    qdrant_call_edge_collection: String,
+    /// Qdrant collection name for typed type edges.
+    qdrant_type_edge_collection: String,
+    /// Qdrant collection name for diagnostic documents.
+    qdrant_diagnostic_collection: String,
     /// Optional Qdrant API key.
     qdrant_api_key: Option<String>,
     /// Ollama endpoint URL.
@@ -83,6 +91,14 @@ impl Default for RuntimeConfig {
                 .unwrap_or_else(|_| "rust_copilot_relations".to_string()),
             qdrant_metadata_collection: std::env::var("QDRANT_METADATA_COLLECTION")
                 .unwrap_or_else(|_| "rust_copilot_metadata".to_string()),
+            qdrant_file_collection: std::env::var("QDRANT_FILE_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_files".to_string()),
+            qdrant_call_edge_collection: std::env::var("QDRANT_CALL_EDGE_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_calls".to_string()),
+            qdrant_type_edge_collection: std::env::var("QDRANT_TYPE_EDGE_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_types".to_string()),
+            qdrant_diagnostic_collection: std::env::var("QDRANT_DIAGNOSTIC_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_diagnostics".to_string()),
             qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
@@ -136,87 +152,15 @@ impl Embed for CodeChunk {
     }
 }
 
-/// Symbol-aware document extracted from Rust source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RustItemDoc {
-    /// Stable id used for incremental upserts/deletes.
-    id: String,
-    /// Item kind: fn, struct, impl, trait, mod, enum, type, const, macro.
-    kind: String,
-    /// Best-effort symbol name (or fully qualified shape for impl blocks).
-    symbol: String,
-    /// Workspace-relative path.
-    file_path: String,
-    /// Workspace identity for query-time isolation.
-    workspace_id: String,
-    /// Absolute file URI (`file://...`) for editor/LSP navigation.
-    uri: String,
-    /// Best-effort module path from file path.
-    module: String,
-    /// Best-effort fully-qualified symbol path.
-    symbol_path: String,
-    /// Owning crate name inferred from workspace Cargo metadata.
-    crate_name: String,
-    /// Rust edition from crate metadata.
-    edition: String,
-    /// Signature/header line.
-    signature: String,
-    /// Joined doc comments directly above the item.
-    docs: String,
-    /// Hover payload extracted from rust-analyzer.
-    hover_summary: String,
-    // /// Signature help summary extracted from rust-analyzer.
-    // signature_help: String,
-    /// Short source excerpt for additional context.
-    body_excerpt: String,
-    /// Inclusive start line (1-based).
-    start_line: usize,
-    /// Start character (0-based, UTF-16 code units) for precise LSP positioning.
-    #[serde(default)]
-    start_character: usize,
-    /// Inclusive end line (1-based).
-    end_line: usize,
-}
 
-impl Embed for RustItemDoc {
-    /// Build embeddings from one canonical search text representation.
+impl Embed for schema::SymbolDoc {
     fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
         embedder.embed(rust_item_search_text(self));
         Ok(())
     }
 }
 
-/// Cross-file relation extracted from rust-analyzer symbol graph APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SymbolRelationDoc {
-    /// Stable id used for incremental upserts/deletes.
-    id: String,
-    /// Workspace identity for query-time isolation.
-    workspace_id: String,
-    /// Relation kind (references, implementations).
-    relation_kind: String,
-    /// Source symbol id in the symbol index.
-    source_symbol_id: String,
-    /// Source symbol name.
-    source_symbol: String,
-    /// Source file path.
-    source_file_path: String,
-    /// Source crate name.
-    source_crate_name: String,
-    /// Source uri.
-    source_uri: String,
-    /// Target file path.
-    target_file_path: String,
-    /// Target uri.
-    target_uri: String,
-    /// Target line range (1-based inclusive).
-    target_start_line: usize,
-    target_end_line: usize,
-    /// Optional target snippet for retrieval quality.
-    target_excerpt: String,
-}
-
-impl Embed for SymbolRelationDoc {
+impl Embed for schema::GraphEdgeDoc {
     fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
         embedder.embed(relation_search_text(self));
         Ok(())
@@ -358,9 +302,17 @@ struct State {
     /// Local in-memory view of indexed chunks by file path.
     chunks_by_file: HashMap<String, Vec<CodeChunk>>,
     /// Local in-memory view of indexed symbol docs by file path.
-    rust_items_by_file: HashMap<String, Vec<RustItemDoc>>,
+    rust_items_by_file: HashMap<String, Vec<schema::SymbolDoc>>,
     /// Local in-memory view of indexed relations by source file path.
-    relations_by_file: HashMap<String, Vec<SymbolRelationDoc>>,
+    relations_by_file: HashMap<String, Vec<schema::GraphEdgeDoc>>,
+    /// Local in-memory file-level docs by file path.
+    file_docs_by_file: HashMap<String, schema::FileDoc>,
+    /// Local in-memory typed call edges by source file path.
+    call_edges_by_file: HashMap<String, Vec<schema::CallEdge>>,
+    /// Local in-memory typed type edges by source file path.
+    type_edges_by_file: HashMap<String, Vec<schema::TypeEdge>>,
+    /// Local in-memory diagnostics by file path.
+    diagnostics_by_file: HashMap<String, Vec<schema::DiagnosticDoc>>,
     /// Count of pending indexing events.
     queue_depth: usize,
     /// Whether worker is currently indexing.
@@ -373,6 +325,14 @@ struct State {
     indexed_ids_by_file: HashMap<String, HashSet<String>>,
     /// Currently indexed relation IDs by file, used for incremental cleanup.
     indexed_relation_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed file-doc IDs by file, used for incremental cleanup.
+    indexed_file_doc_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed call-edge IDs by file, used for incremental cleanup.
+    indexed_call_edge_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed type-edge IDs by file, used for incremental cleanup.
+    indexed_type_edge_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed diagnostic IDs by file, used for incremental cleanup.
+    indexed_diagnostic_ids_by_file: HashMap<String, HashSet<String>>,
     /// Parsed workspace metadata snapshot.
     workspace_metadata: Option<WorkspaceMetadata>,
     /// Indexed metadata docs by crate root.
@@ -425,6 +385,14 @@ struct Services {
     relation_store: QdrantVectorStore,
     /// Dedicated vector store for workspace metadata documents.
     metadata_store: QdrantVectorStore,
+    /// Dedicated vector store for file-level documents.
+    file_store: QdrantVectorStore,
+    /// Dedicated vector store for typed call edges.
+    call_edge_store: QdrantVectorStore,
+    /// Dedicated vector store for typed type edges.
+    type_edge_store: QdrantVectorStore,
+    /// Dedicated vector store for diagnostics.
+    diagnostic_store: QdrantVectorStore,
 }
 
 /// Root application context injected into all tasks and handlers.
@@ -499,7 +467,7 @@ impl RaSessionManager {
         content: &str,
         bulk_mode: bool,
         metrics: &mut FileExtractionMetrics,
-    ) -> Result<Vec<RustItemDoc>> {
+    ) -> Result<Vec<schema::SymbolDoc>> {
         let file_uri = if file_uri.is_empty() {
             path_to_file_uri(file_path_abs)?
         } else {
@@ -534,6 +502,9 @@ impl RaSessionManager {
         }
         enrich_docs_with_lsp_metadata(session, &file_uri, content, &mut docs, bulk_mode, metrics)
             .await?;
+        for doc in &mut docs {
+            doc.finalize_derived_fields();
+        }
         Ok(docs)
     }
 
@@ -553,13 +524,13 @@ impl RaSessionManager {
         file_path_rel: &str,
         file_uri: &str,
         content: &str,
-        docs: &[RustItemDoc],
+        docs: &[schema::SymbolDoc],
         bulk_mode: bool,
         metrics: &mut FileExtractionMetrics,
-    ) -> Result<Vec<SymbolRelationDoc>> {
+    ) -> Result<Vec<schema::GraphEdgeDoc>> {
         let session = self.ensure_session(workspace_root).await?;
         session.sync_document(file_uri, content).await?;
-        extract_symbol_relations_with_lsp(
+        let relations = extract_symbol_relations_with_lsp(
             session,
             workspace_root,
             workspace_id,
@@ -570,7 +541,8 @@ impl RaSessionManager {
             bulk_mode,
             metrics,
         )
-        .await
+        .await?;
+        Ok(relations)
     }
 
     fn session_counters(&self) -> RaSessionCounters {
@@ -917,6 +889,16 @@ struct InitializeParams {
     collection: Option<String>,
     #[serde(rename = "relationCollection")]
     relation_collection: Option<String>,
+    #[serde(rename = "metadataCollection")]
+    metadata_collection: Option<String>,
+    #[serde(rename = "fileCollection")]
+    file_collection: Option<String>,
+    #[serde(rename = "callEdgeCollection")]
+    call_edge_collection: Option<String>,
+    #[serde(rename = "typeEdgeCollection")]
+    type_edge_collection: Option<String>,
+    #[serde(rename = "diagnosticCollection")]
+    diagnostic_collection: Option<String>,
     config: Option<InitializeConfig>,
 }
 
@@ -996,6 +978,45 @@ struct RelationSearchFilters {
     target_file_path: Option<String>,
 }
 
+/// Optional filters accepted by `search_files`.
+#[derive(Debug, Deserialize)]
+struct FileSearchFilters {
+    workspace_id: Option<String>,
+    file_path: Option<String>,
+    module: Option<String>,
+    crate_name: Option<String>,
+}
+
+/// Optional filters accepted by `search_calls`.
+#[derive(Debug, Deserialize)]
+struct CallEdgeSearchFilters {
+    workspace_id: Option<String>,
+    source_file_path: Option<String>,
+    target_file_path: Option<String>,
+    source_symbol_id: Option<String>,
+    target_symbol_id: Option<String>,
+}
+
+/// Optional filters accepted by `search_types`.
+#[derive(Debug, Deserialize)]
+struct TypeEdgeSearchFilters {
+    workspace_id: Option<String>,
+    relation_kind: Option<String>,
+    source_file_path: Option<String>,
+    target_file_path: Option<String>,
+    source_symbol_id: Option<String>,
+    target_symbol_id: Option<String>,
+}
+
+/// Optional filters accepted by `search_diagnostics`.
+#[derive(Debug, Deserialize)]
+struct DiagnosticSearchFilters {
+    workspace_id: Option<String>,
+    file_path: Option<String>,
+    severity: Option<String>,
+    code: Option<String>,
+}
+
 /// `get_file_chunks` request body.
 #[derive(Debug, Deserialize)]
 struct GetFileChunksRequest {
@@ -1027,6 +1048,53 @@ struct SearchRelationsRequest {
     top_k: Option<usize>,
     vector_name: Option<String>,
     filters: Option<RelationSearchFilters>,
+}
+
+/// `search_files` request body.
+#[derive(Debug, Deserialize)]
+struct SearchFilesRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<FileSearchFilters>,
+}
+
+/// `search_calls` request body.
+#[derive(Debug, Deserialize)]
+struct SearchCallsRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<CallEdgeSearchFilters>,
+}
+
+/// `search_types` request body.
+#[derive(Debug, Deserialize)]
+struct SearchTypesRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<TypeEdgeSearchFilters>,
+}
+
+/// `search_diagnostics` request body.
+#[derive(Debug, Deserialize)]
+struct SearchDiagnosticsRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<DiagnosticSearchFilters>,
+}
+
+/// `get_file_context` request body.
+#[derive(Debug, Deserialize)]
+struct FileContextRequest {
+    file_path: String,
+    limit: Option<usize>,
 }
 
 /// `explain_relevance` request body.
@@ -1109,6 +1177,26 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
         .model(&config.embedding_model)
         .build()
         .context("failed to build metadata embedding client")?;
+    let file_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build file embedding client")?;
+    let call_edge_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build call-edge embedding client")?;
+    let type_edge_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build type-edge embedding client")?;
+    let diagnostic_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build diagnostic embedding client")?;
 
     let store = if let Some(api_key) = &config.qdrant_api_key {
         QdrantVectorStore::with_api_key(
@@ -1158,10 +1246,78 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
     }
     .context("failed to initialize metadata Qdrant store")?;
 
+    let file_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            file_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_file_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            file_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_file_collection.clone(),
+        )
+    }
+    .context("failed to initialize file Qdrant store")?;
+
+    let call_edge_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            call_edge_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_call_edge_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            call_edge_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_call_edge_collection.clone(),
+        )
+    }
+    .context("failed to initialize call-edge Qdrant store")?;
+
+    let type_edge_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            type_edge_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_type_edge_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            type_edge_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_type_edge_collection.clone(),
+        )
+    }
+    .context("failed to initialize type-edge Qdrant store")?;
+
+    let diagnostic_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            diagnostic_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_diagnostic_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            diagnostic_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_diagnostic_collection.clone(),
+        )
+    }
+    .context("failed to initialize diagnostic Qdrant store")?;
+
     Ok(Services {
         store,
         relation_store,
         metadata_store,
+        file_store,
+        call_edge_store,
+        type_edge_store,
+        diagnostic_store,
     })
 }
 
@@ -1279,7 +1435,14 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .to_string_lossy()
         .to_string();
 
-    let (previous_ids, previous_relation_ids) = {
+    let (
+        previous_ids,
+        previous_relation_ids,
+        previous_file_doc_ids,
+        previous_call_edge_ids,
+        previous_type_edge_ids,
+        previous_diagnostic_ids,
+    ) = {
         let state = app.state.read().await;
         (
             state
@@ -1289,6 +1452,26 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 .unwrap_or_default(),
             state
                 .indexed_relation_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_file_doc_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_call_edge_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_type_edge_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_diagnostic_ids_by_file
                 .get(&file_rel)
                 .cloned()
                 .unwrap_or_default(),
@@ -1313,12 +1496,52 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 .await
                 .with_context(|| format!("qdrant relation delete failed for {}", file_rel))?;
         }
+        if !previous_file_doc_ids.is_empty() {
+            let stale_file_doc_ids = previous_file_doc_ids.into_iter().collect::<Vec<_>>();
+            services
+                .file_store
+                .delete_documents_by_ids(&stale_file_doc_ids)
+                .await
+                .with_context(|| format!("qdrant file-doc delete failed for {}", file_rel))?;
+        }
+        if !previous_call_edge_ids.is_empty() {
+            let stale_call_edge_ids = previous_call_edge_ids.into_iter().collect::<Vec<_>>();
+            services
+                .call_edge_store
+                .delete_documents_by_ids(&stale_call_edge_ids)
+                .await
+                .with_context(|| format!("qdrant call-edge delete failed for {}", file_rel))?;
+        }
+        if !previous_type_edge_ids.is_empty() {
+            let stale_type_edge_ids = previous_type_edge_ids.into_iter().collect::<Vec<_>>();
+            services
+                .type_edge_store
+                .delete_documents_by_ids(&stale_type_edge_ids)
+                .await
+                .with_context(|| format!("qdrant type-edge delete failed for {}", file_rel))?;
+        }
+        if !previous_diagnostic_ids.is_empty() {
+            let stale_diagnostic_ids = previous_diagnostic_ids.into_iter().collect::<Vec<_>>();
+            services
+                .diagnostic_store
+                .delete_documents_by_ids(&stale_diagnostic_ids)
+                .await
+                .with_context(|| format!("qdrant diagnostic delete failed for {}", file_rel))?;
+        }
         let mut state = app.state.write().await;
         state.rust_items_by_file.remove(&file_rel);
         state.relations_by_file.remove(&file_rel);
         state.chunks_by_file.remove(&file_rel);
+        state.file_docs_by_file.remove(&file_rel);
+        state.call_edges_by_file.remove(&file_rel);
+        state.type_edges_by_file.remove(&file_rel);
+        state.diagnostics_by_file.remove(&file_rel);
         state.indexed_ids_by_file.remove(&file_rel);
         state.indexed_relation_ids_by_file.remove(&file_rel);
+        state.indexed_file_doc_ids_by_file.remove(&file_rel);
+        state.indexed_call_edge_ids_by_file.remove(&file_rel);
+        state.indexed_type_edge_ids_by_file.remove(&file_rel);
+        state.indexed_diagnostic_ids_by_file.remove(&file_rel);
         return Ok(());
     }
 
@@ -1493,11 +1716,25 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         }
     }
 
+    let crate_name = find_crate_metadata_for_file(&metadata_docs_by_crate, &file_rel)
+        .map(|m| m.crate_name.clone())
+        .unwrap_or_default();
+    let file_doc = build_file_doc(&workspace_id, &file_rel, &file_uri, &content, &crate_name);
+    let (call_edges, type_edges) =
+        build_typed_edges_from_relations(&workspace_id, &relation_docs, &final_docs);
+    let diagnostics = build_diagnostic_docs(
+        &workspace_id,
+        &file_rel,
+        &file_uri,
+        final_docs.iter().map(|d| d.end_line).max().unwrap_or(1),
+        &file_metrics,
+    );
+
     let symbol_rows = final_docs
         .iter()
         .map(|doc| NamedVectorDocument {
             id: doc.id.clone(),
-            raw: schema::SymbolDoc::from_legacy(doc),
+            raw: doc.clone(),
             vectors: rust_item_named_vectors(doc),
         })
         .collect::<Vec<_>>();
@@ -1513,7 +1750,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .iter()
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
-                raw: schema::GraphEdgeDoc::from_legacy(doc),
+                raw: doc.clone(),
                 vectors: relation_named_vectors(doc),
             })
             .collect::<Vec<_>>();
@@ -1522,6 +1759,65 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .insert_documents_with_named_vectors(relation_rows)
             .await
             .with_context(|| format!("qdrant relation upsert failed for {}", file_rel))?;
+    }
+
+    let file_rows = vec![NamedVectorDocument {
+        id: file_doc.id.clone(),
+        raw: file_doc.clone(),
+        vectors: file_doc_named_vectors(&file_doc),
+    }];
+    services
+        .file_store
+        .insert_documents_with_named_vectors(file_rows)
+        .await
+        .with_context(|| format!("qdrant file-doc upsert failed for {}", file_rel))?;
+
+    if !call_edges.is_empty() {
+        let call_edge_rows = call_edges
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: call_edge_named_vectors(doc),
+            })
+            .collect::<Vec<_>>();
+        services
+            .call_edge_store
+            .insert_documents_with_named_vectors(call_edge_rows)
+            .await
+            .with_context(|| format!("qdrant call-edge upsert failed for {}", file_rel))?;
+    }
+
+    if !type_edges.is_empty() {
+        let type_edge_rows = type_edges
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: type_edge_named_vectors(doc),
+            })
+            .collect::<Vec<_>>();
+        services
+            .type_edge_store
+            .insert_documents_with_named_vectors(type_edge_rows)
+            .await
+            .with_context(|| format!("qdrant type-edge upsert failed for {}", file_rel))?;
+    }
+
+    if !diagnostics.is_empty() {
+        let diagnostic_rows = diagnostics
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: diagnostic_named_vectors(doc),
+            })
+            .collect::<Vec<_>>();
+        services
+            .diagnostic_store
+            .insert_documents_with_named_vectors(diagnostic_rows)
+            .await
+            .with_context(|| format!("qdrant diagnostic upsert failed for {}", file_rel))?;
     }
 
     let final_chunks = symbol_docs_to_chunks(&final_docs);
@@ -1545,6 +1841,19 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .iter()
         .map(|doc| doc.id.clone())
         .collect::<HashSet<_>>();
+    let final_file_doc_ids = [file_doc.id.clone()].into_iter().collect::<HashSet<_>>();
+    let final_call_edge_ids = call_edges
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    let final_type_edge_ids = type_edges
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    let final_diagnostic_ids = diagnostics
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
     let stale_relation_ids = previous_relation_ids
         .difference(&final_relation_ids)
         .cloned()
@@ -1556,6 +1865,50 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .await
             .with_context(|| format!("qdrant relation stale delete failed for {}", file_rel))?;
     }
+    let stale_file_doc_ids = previous_file_doc_ids
+        .difference(&final_file_doc_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_file_doc_ids.is_empty() {
+        services
+            .file_store
+            .delete_documents_by_ids(&stale_file_doc_ids)
+            .await
+            .with_context(|| format!("qdrant file-doc stale delete failed for {}", file_rel))?;
+    }
+    let stale_call_edge_ids = previous_call_edge_ids
+        .difference(&final_call_edge_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_call_edge_ids.is_empty() {
+        services
+            .call_edge_store
+            .delete_documents_by_ids(&stale_call_edge_ids)
+            .await
+            .with_context(|| format!("qdrant call-edge stale delete failed for {}", file_rel))?;
+    }
+    let stale_type_edge_ids = previous_type_edge_ids
+        .difference(&final_type_edge_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_type_edge_ids.is_empty() {
+        services
+            .type_edge_store
+            .delete_documents_by_ids(&stale_type_edge_ids)
+            .await
+            .with_context(|| format!("qdrant type-edge stale delete failed for {}", file_rel))?;
+    }
+    let stale_diagnostic_ids = previous_diagnostic_ids
+        .difference(&final_diagnostic_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_diagnostic_ids.is_empty() {
+        services
+            .diagnostic_store
+            .delete_documents_by_ids(&stale_diagnostic_ids)
+            .await
+            .with_context(|| format!("qdrant diagnostic stale delete failed for {}", file_rel))?;
+    }
 
     file_metrics.symbols_indexed = final_docs.len();
     file_metrics.relations_indexed = relation_docs.len();
@@ -1566,13 +1919,29 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
     state
         .relations_by_file
         .insert(file_rel.clone(), relation_docs.clone());
+    state.file_docs_by_file.insert(file_rel.clone(), file_doc);
+    state.call_edges_by_file.insert(file_rel.clone(), call_edges);
+    state.type_edges_by_file.insert(file_rel.clone(), type_edges);
+    state.diagnostics_by_file.insert(file_rel.clone(), diagnostics);
     state.chunks_by_file.insert(file_rel.clone(), final_chunks);
     state
         .indexed_ids_by_file
         .insert(file_rel.clone(), final_ids);
     state
         .indexed_relation_ids_by_file
-        .insert(file_rel, final_relation_ids);
+        .insert(file_rel.clone(), final_relation_ids);
+    state
+        .indexed_file_doc_ids_by_file
+        .insert(file_rel.clone(), final_file_doc_ids);
+    state
+        .indexed_call_edge_ids_by_file
+        .insert(file_rel.clone(), final_call_edge_ids);
+    state
+        .indexed_type_edge_ids_by_file
+        .insert(file_rel.clone(), final_type_edge_ids);
+    state
+        .indexed_diagnostic_ids_by_file
+        .insert(file_rel, final_diagnostic_ids);
     let metrics = &mut state.extraction_metrics;
     metrics.files_reindexed_total += 1;
     if file_metrics.fallback_heuristic {
@@ -1629,11 +1998,22 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    let (relation_ids_to_delete, symbol_ids_to_delete) = {
+    let (
+        relation_ids_to_delete,
+        symbol_ids_to_delete,
+        file_doc_ids_to_delete,
+        call_edge_ids_to_delete,
+        type_edge_ids_to_delete,
+        diagnostic_ids_to_delete,
+    ) = {
         let mut state = app.state.write().await;
         state.rust_items_by_file.remove(&file_rel);
         state.relations_by_file.remove(&file_rel);
         state.chunks_by_file.remove(&file_rel);
+        state.file_docs_by_file.remove(&file_rel);
+        state.call_edges_by_file.remove(&file_rel);
+        state.type_edges_by_file.remove(&file_rel);
+        state.diagnostics_by_file.remove(&file_rel);
         let relation_ids_to_delete = state
             .indexed_relation_ids_by_file
             .remove(&file_rel)
@@ -1646,7 +2026,38 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
-        (relation_ids_to_delete, symbol_ids_to_delete)
+        let file_doc_ids_to_delete = state
+            .indexed_file_doc_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let call_edge_ids_to_delete = state
+            .indexed_call_edge_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let type_edge_ids_to_delete = state
+            .indexed_type_edge_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let diagnostic_ids_to_delete = state
+            .indexed_diagnostic_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        (
+            relation_ids_to_delete,
+            symbol_ids_to_delete,
+            file_doc_ids_to_delete,
+            call_edge_ids_to_delete,
+            type_edge_ids_to_delete,
+            diagnostic_ids_to_delete,
+        )
     };
     if !symbol_ids_to_delete.is_empty() {
         let services = app.services.read().await.clone();
@@ -1664,38 +2075,74 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
             .await
             .with_context(|| format!("qdrant relation delete failed for {}", file_rel))?;
     }
+    if !file_doc_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .file_store
+            .delete_documents_by_ids(&file_doc_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant file-doc delete failed for {}", file_rel))?;
+    }
+    if !call_edge_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .call_edge_store
+            .delete_documents_by_ids(&call_edge_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant call-edge delete failed for {}", file_rel))?;
+    }
+    if !type_edge_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .type_edge_store
+            .delete_documents_by_ids(&type_edge_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant type-edge delete failed for {}", file_rel))?;
+    }
+    if !diagnostic_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .diagnostic_store
+            .delete_documents_by_ids(&diagnostic_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant diagnostic delete failed for {}", file_rel))?;
+    }
 
     Ok(())
 }
 
-fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<RustItemDoc> {
+fn coarse_chunks_to_symbol_docs(chunks: &[CodeChunk]) -> Vec<schema::SymbolDoc> {
     chunks
         .iter()
-        .map(|chunk| RustItemDoc {
-            id: chunk.chunk_id.clone(),
-            kind: normalize_chunk_kind(&chunk.kind).to_string(),
-            symbol: format!("chunk_{}_{}", chunk.start_line, chunk.end_line),
-            file_path: chunk.file_path.clone(),
-            workspace_id: chunk.workspace_id.clone(),
-            uri: chunk.uri.clone(),
-            module: module_from_file_path(&chunk.file_path),
-            symbol_path: String::new(),
-            crate_name: String::new(),
-            edition: String::new(),
-            signature: chunk
-                .text
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-            docs: String::new(),
-            hover_summary: String::new(),
-            // signature_help: String::new(),
-            body_excerpt: chunk.text.clone(),
-            start_line: chunk.start_line,
-            start_character: 0,
-            end_line: chunk.end_line,
+        .map(|chunk| {
+            let mut doc = schema::SymbolDoc {
+                id: chunk.chunk_id.clone(),
+                kind: normalize_chunk_kind(&chunk.kind).to_string(),
+                symbol: format!("chunk_{}_{}", chunk.start_line, chunk.end_line),
+                file_path: chunk.file_path.clone(),
+                workspace_id: chunk.workspace_id.clone(),
+                uri: chunk.uri.clone(),
+                module: module_from_file_path(&chunk.file_path),
+                symbol_path: String::new(),
+                crate_name: String::new(),
+                edition: String::new(),
+                signature: chunk
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                docs: String::new(),
+                hover_summary: String::new(),
+                body_excerpt: chunk.text.clone(),
+                start_line: chunk.start_line,
+                start_character: 0,
+                end_line: chunk.end_line,
+                ..Default::default()
+            };
+            doc.finalize_derived_fields();
+            doc
         })
         .collect()
 }
@@ -1866,7 +2313,7 @@ fn derive_workspace_id(workspace_root: &Path) -> String {
     format!("ws_{}", simple_hash(&workspace_root.to_string_lossy()))
 }
 
-fn rust_item_search_text(doc: &RustItemDoc) -> String {
+fn rust_item_search_text(doc: &schema::SymbolDoc) -> String {
     format!(
         // "{symbol}\n{symbol_path}\n{signature}\n{signature_help}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
         "{symbol}\n{symbol_path}\n{signature}\n{docs}\n{hover_summary}\n{body_excerpt}\nmodule: {module}\ncrate: {crate_name}\nedition: {edition}\npath: {file_path}\nkind: {kind}\nuri: {uri}\nworkspace_id: {workspace_id}",
@@ -1887,7 +2334,7 @@ fn rust_item_search_text(doc: &RustItemDoc) -> String {
     )
 }
 
-fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
+fn rust_item_named_vectors(doc: &schema::SymbolDoc) -> HashMap<String, String> {
     HashMap::from([
         (
             SYMBOL_VECTOR_NAME.to_string(),
@@ -1929,7 +2376,7 @@ fn rust_item_named_vectors(doc: &RustItemDoc) -> HashMap<String, String> {
     ])
 }
 
-fn relation_search_text(doc: &SymbolRelationDoc) -> String {
+fn relation_search_text(doc: &schema::GraphEdgeDoc) -> String {
     format!(
         "{relation_kind}\nsource_symbol: {source_symbol}\nsource_crate: {source_crate}\nsource_file: {source_file}\ntarget_file: {target_file}\nexcerpt:\n{excerpt}\nworkspace_id: {workspace_id}",
         relation_kind = doc.relation_kind,
@@ -1942,7 +2389,7 @@ fn relation_search_text(doc: &SymbolRelationDoc) -> String {
     )
 }
 
-fn relation_named_vectors(doc: &SymbolRelationDoc) -> HashMap<String, String> {
+fn relation_named_vectors(doc: &schema::GraphEdgeDoc) -> HashMap<String, String> {
     let mut vectors = HashMap::from([
         (
             SYMBOL_VECTOR_NAME.to_string(),
@@ -2042,6 +2489,269 @@ fn crate_metadata_named_vectors(doc: &CrateMetadataDoc) -> HashMap<String, Strin
             ),
         ),
     ])
+}
+
+fn file_doc_search_text(doc: &schema::FileDoc) -> String {
+    format!(
+        "file: {file_path}\nmodule: {module}\ncrate: {crate_name}\nuri: {uri}\nworkspace_id: {workspace_id}",
+        file_path = doc.file_path,
+        module = doc.module,
+        crate_name = doc.crate_name,
+        uri = doc.uri,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn file_doc_named_vectors(doc: &schema::FileDoc) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{file_path}\nmodule: {module}\ncrate: {crate_name}\nworkspace_id: {workspace_id}",
+                file_path = doc.file_path,
+                module = doc.module,
+                crate_name = doc.crate_name,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            DOCS_VECTOR_NAME.to_string(),
+            file_doc_search_text(doc),
+        ),
+    ])
+}
+
+fn call_edge_search_text(doc: &schema::CallEdge) -> String {
+    format!(
+        "call_edge\nsource_symbol_id: {source}\ntarget_symbol_id: {target}\nsource_file: {source_file}\ntarget_file: {target_file}\nworkspace_id: {workspace_id}",
+        source = doc.source_symbol_id,
+        target = doc.target_symbol_id,
+        source_file = doc.source_span.file_path,
+        target_file = doc.target_span.file_path,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn call_edge_named_vectors(doc: &schema::CallEdge) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{source}\n{target}\nworkspace_id: {workspace_id}",
+                source = doc.source_symbol_id,
+                target = doc.target_symbol_id,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            DOCS_VECTOR_NAME.to_string(),
+            call_edge_search_text(doc),
+        ),
+    ])
+}
+
+fn type_edge_search_text(doc: &schema::TypeEdge) -> String {
+    format!(
+        "type_edge\nrelation_kind: {relation_kind}\nsource_symbol_id: {source}\ntarget_symbol_id: {target}\nsource_file: {source_file}\ntarget_file: {target_file}\nworkspace_id: {workspace_id}",
+        relation_kind = doc.relation_kind,
+        source = doc.source_symbol_id,
+        target = doc.target_symbol_id,
+        source_file = doc.source_span.file_path,
+        target_file = doc.target_span.file_path,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn type_edge_named_vectors(doc: &schema::TypeEdge) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{source}\n{target}\nrelation_kind: {relation_kind}\nworkspace_id: {workspace_id}",
+                source = doc.source_symbol_id,
+                target = doc.target_symbol_id,
+                relation_kind = doc.relation_kind,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            DOCS_VECTOR_NAME.to_string(),
+            type_edge_search_text(doc),
+        ),
+    ])
+}
+
+fn diagnostic_search_text(doc: &schema::DiagnosticDoc) -> String {
+    format!(
+        "diagnostic\nseverity: {severity}\ncode: {code}\nmessage: {message}\nfile: {file_path}\nworkspace_id: {workspace_id}",
+        severity = doc.severity,
+        code = doc.code.clone().unwrap_or_default(),
+        message = doc.message,
+        file_path = doc.file_path,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn diagnostic_named_vectors(doc: &schema::DiagnosticDoc) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{severity}\n{file_path}\nworkspace_id: {workspace_id}",
+                severity = doc.severity,
+                file_path = doc.file_path,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            DOCS_VECTOR_NAME.to_string(),
+            diagnostic_search_text(doc),
+        ),
+    ])
+}
+
+fn build_file_doc(
+    workspace_id: &str,
+    file_rel: &str,
+    file_uri: &str,
+    content: &str,
+    crate_name: &str,
+) -> schema::FileDoc {
+    schema::FileDoc {
+        id: format!("file:{workspace_id}:{file_rel}"),
+        workspace_id: workspace_id.to_string(),
+        crate_name: crate_name.to_string(),
+        file_path: file_rel.to_string(),
+        uri: file_uri.to_string(),
+        module: module_from_file_path(file_rel),
+        body_hash: simple_hash(content),
+    }
+}
+
+fn build_typed_edges_from_relations(
+    workspace_id: &str,
+    relation_docs: &[schema::GraphEdgeDoc],
+    symbol_docs: &[schema::SymbolDoc],
+) -> (Vec<schema::CallEdge>, Vec<schema::TypeEdge>) {
+    let mut call_edges = Vec::new();
+    let mut type_edges = Vec::new();
+    let by_id = symbol_docs
+        .iter()
+        .map(|doc| (doc.id.as_str(), &doc.span))
+        .collect::<HashMap<_, _>>();
+
+    for relation in relation_docs {
+        let source_span = by_id
+            .get(relation.source_symbol_id.as_str())
+            .copied()
+            .cloned()
+            .unwrap_or(schema::Span {
+                file_path: relation.source_file_path.clone(),
+                uri: relation.source_uri.clone(),
+                start_line: 0,
+                start_character: 0,
+                end_line: 0,
+                end_character: None,
+            });
+        let target_span = schema::Span {
+            file_path: relation.target_file_path.clone(),
+            uri: relation.target_uri.clone(),
+            start_line: relation.target_start_line,
+            start_character: 0,
+            end_line: relation.target_end_line,
+            end_character: None,
+        };
+        let target_symbol_id = format!(
+            "target:{workspace_id}:{file}:{start}:{end}",
+            file = relation.target_file_path,
+            start = relation.target_start_line,
+            end = relation.target_end_line
+        );
+
+        if relation.relation_kind == "references" {
+            call_edges.push(schema::CallEdge {
+                id: format!(
+                    "call_edge:{workspace_id}:{source}:{target}",
+                    source = relation.source_symbol_id,
+                    target = target_symbol_id
+                ),
+                workspace_id: workspace_id.to_string(),
+                source_symbol_id: relation.source_symbol_id.clone(),
+                target_symbol_id: target_symbol_id.clone(),
+                source_span: source_span.clone(),
+                target_span: target_span.clone(),
+            });
+        } else {
+            type_edges.push(schema::TypeEdge {
+                id: format!(
+                    "type_edge:{workspace_id}:{kind}:{source}:{target}",
+                    kind = relation.relation_kind,
+                    source = relation.source_symbol_id,
+                    target = target_symbol_id
+                ),
+                workspace_id: workspace_id.to_string(),
+                source_symbol_id: relation.source_symbol_id.clone(),
+                target_symbol_id: target_symbol_id.clone(),
+                relation_kind: relation.relation_kind.clone(),
+                source_span: source_span.clone(),
+                target_span: target_span.clone(),
+            });
+        }
+    }
+
+    (call_edges, type_edges)
+}
+
+fn build_diagnostic_docs(
+    workspace_id: &str,
+    file_rel: &str,
+    file_uri: &str,
+    end_line: usize,
+    file_metrics: &FileExtractionMetrics,
+) -> Vec<schema::DiagnosticDoc> {
+    let mut out = Vec::new();
+    if file_metrics.fallback_heuristic {
+        out.push(schema::DiagnosticDoc {
+            id: format!("diagnostic:{workspace_id}:{file_rel}:fallback_heuristic"),
+            workspace_id: workspace_id.to_string(),
+            file_path: file_rel.to_string(),
+            uri: file_uri.to_string(),
+            severity: "warning".to_string(),
+            code: Some("fallback_heuristic".to_string()),
+            message: "rust-analyzer symbol extraction fallback heuristic was used".to_string(),
+            span: schema::Span {
+                file_path: file_rel.to_string(),
+                uri: file_uri.to_string(),
+                start_line: 1,
+                start_character: 0,
+                end_line,
+                end_character: None,
+            },
+        });
+    }
+    if file_metrics.request_timeouts > 0 {
+        out.push(schema::DiagnosticDoc {
+            id: format!("diagnostic:{workspace_id}:{file_rel}:request_timeouts"),
+            workspace_id: workspace_id.to_string(),
+            file_path: file_rel.to_string(),
+            uri: file_uri.to_string(),
+            severity: "warning".to_string(),
+            code: Some("request_timeouts".to_string()),
+            message: format!(
+                "rust-analyzer requests timed out {} time(s) during extraction",
+                file_metrics.request_timeouts
+            ),
+            span: schema::Span {
+                file_path: file_rel.to_string(),
+                uri: file_uri.to_string(),
+                start_line: 1,
+                start_character: 0,
+                end_line,
+                end_character: None,
+            },
+        });
+    }
+    out
 }
 
 fn build_crate_metadata_docs(
@@ -2216,10 +2926,10 @@ async fn extract_symbol_relations_with_lsp(
     file_path_rel: &str,
     file_uri: &str,
     content: &str,
-    docs: &[RustItemDoc],
+    docs: &[schema::SymbolDoc],
     bulk_mode: bool,
     metrics: &mut FileExtractionMetrics,
-) -> Result<Vec<SymbolRelationDoc>> {
+) -> Result<Vec<schema::GraphEdgeDoc>> {
     let source_lines = content.lines().collect::<Vec<_>>();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -2502,13 +3212,13 @@ async fn extract_symbol_relations_with_lsp(
 }
 
 async fn append_relation_targets(
-    out: &mut Vec<SymbolRelationDoc>,
+    out: &mut Vec<schema::GraphEdgeDoc>,
     seen: &mut HashSet<String>,
     cache: &mut HashMap<PathBuf, Vec<String>>,
     workspace_root: &Path,
     workspace_id: &str,
     source_file_path: &str,
-    source_doc: &RustItemDoc,
+    source_doc: &schema::SymbolDoc,
     relation_kind: &str,
     payload: Value,
     source_lines: &[&str],
@@ -2530,13 +3240,13 @@ async fn append_relation_targets(
 }
 
 async fn append_relation_targets_with_filter(
-    out: &mut Vec<SymbolRelationDoc>,
+    out: &mut Vec<schema::GraphEdgeDoc>,
     seen: &mut HashSet<String>,
     cache: &mut HashMap<PathBuf, Vec<String>>,
     workspace_root: &Path,
     workspace_id: &str,
     source_file_path: &str,
-    source_doc: &RustItemDoc,
+    source_doc: &schema::SymbolDoc,
     relation_kind: &str,
     payload: Value,
     source_lines: &[&str],
@@ -2593,10 +3303,11 @@ async fn append_relation_targets_with_filter(
             start = loc.start_line,
             end = loc.end_line
         );
-        out.push(SymbolRelationDoc {
+        out.push(schema::GraphEdgeDoc {
             id,
             workspace_id: workspace_id.to_string(),
             relation_kind: relation_kind.to_string(),
+            edge_type: schema::GraphEdgeDoc::edge_type_for_relation_kind(relation_kind).to_string(),
             source_symbol_id: source_doc.id.clone(),
             source_symbol: source_doc.symbol.clone(),
             source_file_path: source_file_path.to_string(),
@@ -2740,7 +3451,7 @@ async fn enrich_docs_with_lsp_metadata(
     session: &mut RaLspSession,
     file_uri: &str,
     content: &str,
-    docs: &mut [RustItemDoc],
+    docs: &mut [schema::SymbolDoc],
     bulk_mode: bool,
     metrics: &mut FileExtractionMetrics,
 ) -> Result<()> {
@@ -2862,7 +3573,7 @@ async fn enrich_docs_with_lsp_metadata(
     Ok(())
 }
 
-fn should_extract_relations_for_symbol(doc: &RustItemDoc, bulk_mode: bool) -> bool {
+fn should_extract_relations_for_symbol(doc: &schema::SymbolDoc, bulk_mode: bool) -> bool {
     match doc.kind.as_str() {
         // Skip noisy/low-value leaf symbols for relation extraction.
         "var" | "module" => false,
@@ -2872,19 +3583,19 @@ fn should_extract_relations_for_symbol(doc: &RustItemDoc, bulk_mode: bool) -> bo
     }
 }
 
-fn should_request_implementations_for_symbol(doc: &RustItemDoc) -> bool {
+fn should_request_implementations_for_symbol(doc: &schema::SymbolDoc) -> bool {
     matches!(doc.kind.as_str(), "trait" | "struct" | "method")
 }
 
-fn should_fallback_implementations_from_references(doc: &RustItemDoc) -> bool {
+fn should_fallback_implementations_from_references(doc: &schema::SymbolDoc) -> bool {
     matches!(doc.kind.as_str(), "struct" | "enum")
 }
 
-fn should_request_type_definitions_for_symbol(doc: &RustItemDoc) -> bool {
+fn should_request_type_definitions_for_symbol(doc: &schema::SymbolDoc) -> bool {
     matches!(doc.kind.as_str(), "trait" | "struct" | "enum")
 }
 
-fn should_debug_missing_type_definition_symbol(doc: &RustItemDoc) -> bool {
+fn should_debug_missing_type_definition_symbol(doc: &schema::SymbolDoc) -> bool {
     matches!(doc.symbol.as_str(), "Rule" | "ValueState")
 }
 
@@ -2951,7 +3662,7 @@ fn lsp_workspace_symbol_path_for_item(
     best.map(|(_, v)| v)
 }
 
-fn maybe_upgrade_symbol_path(doc: &mut RustItemDoc, workspace_path: &str) {
+fn maybe_upgrade_symbol_path(doc: &mut schema::SymbolDoc, workspace_path: &str) {
     let candidate = normalize_symbol_path_candidate(&doc.module, &doc.symbol, workspace_path);
     if candidate.is_empty() {
         return;
@@ -3157,7 +3868,7 @@ fn parse_lsp_symbols(
     file_path: &str,
     uri: &str,
     content: &str,
-) -> Vec<RustItemDoc> {
+) -> Vec<schema::SymbolDoc> {
     let Some(items) = result.as_array() else {
         return Vec::new();
     };
@@ -3189,7 +3900,7 @@ fn collect_lsp_symbol_docs(
     uri: &str,
     module: &str,
     lines: &[&str],
-    out: &mut Vec<RustItemDoc>,
+    out: &mut Vec<schema::SymbolDoc>,
 ) {
     let Some(name) = item.get("name").and_then(Value::as_str) else {
         return;
@@ -3209,7 +3920,7 @@ fn collect_lsp_symbol_docs(
         let excerpt = excerpt_from_range(lines, start_idx, end_idx, 60);
         let id = format!("symbol:{workspace_id}:{file_path}:{kind}:{name}:{start_line}:{end_line}");
 
-        out.push(RustItemDoc {
+        let mut doc = schema::SymbolDoc {
             id,
             kind,
             symbol: name.to_string(),
@@ -3223,12 +3934,14 @@ fn collect_lsp_symbol_docs(
             signature,
             docs,
             hover_summary: String::new(),
-            // signature_help: String::new(),
             body_excerpt: excerpt,
             start_line,
             start_character,
             end_line,
-        });
+            ..Default::default()
+        };
+        doc.finalize_derived_fields();
+        out.push(doc);
     }
 
     if let Some(children) = item.get("children").and_then(Value::as_array) {
@@ -3313,7 +4026,7 @@ fn extract_symbol_docs_heuristic(
     file_path: &str,
     uri: &str,
     content: &str,
-) -> Vec<RustItemDoc> {
+) -> Vec<schema::SymbolDoc> {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.is_empty() {
         return Vec::new();
@@ -3338,7 +4051,7 @@ fn extract_symbol_docs_heuristic(
         let id =
             format!("symbol:{workspace_id}:{file_path}:{kind}:{symbol}:{start_line}:{end_line}");
 
-        docs.push(RustItemDoc {
+        let mut doc = schema::SymbolDoc {
             id,
             kind: kind.to_string(),
             symbol: symbol.clone(),
@@ -3352,12 +4065,14 @@ fn extract_symbol_docs_heuristic(
             signature,
             docs: item_docs,
             hover_summary: String::new(),
-            // signature_help: String::new(),
             body_excerpt,
             start_line,
             start_character: symbol_start_character(lines[line_idx], &symbol),
             end_line,
-        });
+            ..Default::default()
+        };
+        doc.finalize_derived_fields();
+        docs.push(doc);
 
         line_idx = end_line;
     }
@@ -3365,7 +4080,7 @@ fn extract_symbol_docs_heuristic(
     docs
 }
 
-fn symbol_docs_to_chunks(docs: &[RustItemDoc]) -> Vec<CodeChunk> {
+fn symbol_docs_to_chunks(docs: &[schema::SymbolDoc]) -> Vec<CodeChunk> {
     docs.iter()
         .map(|doc| {
             let text = format!(
@@ -3407,7 +4122,7 @@ fn find_crate_metadata_for_file<'a>(
         .map(|(_, doc)| doc)
 }
 
-fn apply_crate_metadata_to_symbol_docs(docs: &mut [RustItemDoc], meta: &CrateMetadataDoc) {
+fn apply_crate_metadata_to_symbol_docs(docs: &mut [schema::SymbolDoc], meta: &CrateMetadataDoc) {
     for doc in docs {
         doc.crate_name = meta.crate_name.clone();
         doc.edition = meta.edition.clone();
@@ -3421,7 +4136,10 @@ fn apply_crate_metadata_to_symbol_docs(docs: &mut [RustItemDoc], meta: &CrateMet
     }
 }
 
-fn apply_crate_metadata_to_relation_docs(docs: &mut [SymbolRelationDoc], meta: &CrateMetadataDoc) {
+fn apply_crate_metadata_to_relation_docs(
+    docs: &mut [schema::GraphEdgeDoc],
+    meta: &CrateMetadataDoc,
+) {
     for doc in docs {
         doc.source_crate_name = meta.crate_name.clone();
     }
@@ -3722,8 +4440,8 @@ mod tests {
         kind: &str,
         symbol: &str,
         excerpt: &str,
-    ) -> RustItemDoc {
-        RustItemDoc {
+    ) -> schema::SymbolDoc {
+        let mut doc = schema::SymbolDoc {
             id: id.to_string(),
             kind: kind.to_string(),
             symbol: symbol.to_string(),
@@ -3737,12 +4455,14 @@ mod tests {
             signature: format!("fn {symbol}() {{}}"),
             docs: String::new(),
             hover_summary: String::new(),
-            // signature_help: String::new(),
             body_excerpt: excerpt.to_string(),
             start_line: 1,
             start_character: 0,
             end_line: 3,
-        }
+            ..Default::default()
+        };
+        doc.finalize_derived_fields();
+        doc
     }
 
     #[test]
@@ -3807,19 +4527,21 @@ mod tests {
     #[test]
     fn lexical_search_ranks_more_matching_chunks_higher() {
         let mut map = HashMap::new();
-        map.insert(
-            "src/main.rs".to_string(),
-            vec![
-                sample_item(
-                    "src/main.rs",
-                    "c1",
-                    "fn",
-                    "search_code",
-                    r#"fn search_code() { let query = "rust"; }"#,
-                ),
-                sample_item("src/main.rs", "c2", "mod", "parser", "mod parser;"),
-            ],
+        let c1 = sample_item(
+            "src/main.rs",
+            "c1",
+            "fn",
+            "search_code",
+            r#"fn search_code() { let query = "rust"; }"#,
         );
+        let c2 = sample_item(
+            "src/main.rs",
+            "c2",
+            "mod",
+            "parser",
+            "mod parser;",
+        );
+        map.insert("src/main.rs".to_string(), vec![c1, c2]);
 
         let ranked = mcp_layer::lexical_search(map, "search rust", 5);
         assert_eq!(ranked.len(), 1);
@@ -3972,7 +4694,7 @@ where
 
     #[test]
     fn symbol_docs_to_chunks_uses_stable_symbol_ids() {
-        let docs = vec![RustItemDoc {
+        let docs = vec![schema::SymbolDoc {
             id: "symbol:ws_test:src/lib.rs:fn:add:1:3".to_string(),
             kind: "fn".to_string(),
             symbol: "add".to_string(),
@@ -3986,21 +4708,20 @@ where
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
-            // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             start_character: 3,
             end_line: 3,
+            ..Default::default()
         }];
-
         let chunks = symbol_docs_to_chunks(&docs);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_id, "symbol:ws_test:src/lib.rs:fn:add:1:3");
     }
 
     #[test]
-    fn canonical_symbol_doc_round_trip_preserves_legacy_shape() {
-        let legacy = RustItemDoc {
+    fn canonical_symbol_doc_derives_expected_fields() {
+        let mut doc = schema::SymbolDoc {
             id: "symbol:ws_test:src/lib.rs:fn:add:1:3".to_string(),
             kind: "fn".to_string(),
             symbol: "add".to_string(),
@@ -4018,26 +4739,21 @@ where
             start_line: 1,
             start_character: 3,
             end_line: 3,
+            ..Default::default()
         };
-
-        let canonical = schema::SymbolDoc::from_legacy(&legacy);
-        assert_eq!(canonical.symbol_id_stable, legacy.id);
-        assert!(!canonical.body_hash.is_empty());
-        assert_eq!(canonical.span.file_path, legacy.file_path);
-
-        let back = canonical.to_legacy();
-        assert_eq!(back.id, legacy.id);
-        assert_eq!(back.symbol, legacy.symbol);
-        assert_eq!(back.file_path, legacy.file_path);
-        assert_eq!(back.hover_summary, legacy.hover_summary);
+        doc.finalize_derived_fields();
+        assert_eq!(doc.symbol_id_stable, doc.id);
+        assert!(!doc.body_hash.is_empty());
+        assert_eq!(doc.span.file_path, doc.file_path);
     }
 
     #[test]
-    fn canonical_graph_edge_round_trip_preserves_legacy_shape() {
-        let legacy = SymbolRelationDoc {
+    fn canonical_graph_edge_sets_edge_type() {
+        let edge = schema::GraphEdgeDoc {
             id: "relation:ws_test:implementations:symbol:ws_test:src/lib.rs:trait:Rule:1:1:src/types.rs:4:4".to_string(),
             workspace_id: "ws_test".to_string(),
             relation_kind: "implementations".to_string(),
+            edge_type: schema::GraphEdgeDoc::edge_type_for_relation_kind("implementations").to_string(),
             source_symbol_id: "symbol:ws_test:src/lib.rs:trait:Rule:1:1".to_string(),
             source_symbol: "Rule".to_string(),
             source_file_path: "src/lib.rs".to_string(),
@@ -4049,20 +4765,13 @@ where
             target_end_line: 4,
             target_excerpt: "impl crate::Rule for PositiveRule {".to_string(),
         };
-
-        let canonical = schema::GraphEdgeDoc::from_legacy(&legacy);
-        assert_eq!(canonical.edge_type, "impl_to_trait");
-        assert_eq!(canonical.relation_kind, legacy.relation_kind);
-
-        let back = canonical.to_legacy();
-        assert_eq!(back.id, legacy.id);
-        assert_eq!(back.source_symbol_id, legacy.source_symbol_id);
-        assert_eq!(back.target_excerpt, legacy.target_excerpt);
+        assert_eq!(edge.edge_type, "impl_to_trait");
+        assert_eq!(edge.relation_kind, "implementations");
     }
 
     #[test]
     fn rust_item_search_text_contains_canonical_fields() {
-        let doc = RustItemDoc {
+        let doc = schema::SymbolDoc {
             id: "symbol:ws_test:src/lib.rs:fn:add:1:3".to_string(),
             kind: "fn".to_string(),
             symbol: "add".to_string(),
@@ -4076,13 +4785,12 @@ where
             signature: "fn add(a: i32, b: i32) -> i32 {".to_string(),
             docs: "Adds numbers".to_string(),
             hover_summary: "hover add".to_string(),
-            // signature_help: "fn add(a: i32, b: i32) -> i32".to_string(),
             body_excerpt: "a + b".to_string(),
             start_line: 1,
             start_character: 3,
             end_line: 3,
+            ..Default::default()
         };
-
         let search_text = rust_item_search_text(&doc);
         assert!(search_text.contains("add"));
         assert!(search_text.contains("module: src::lib"));

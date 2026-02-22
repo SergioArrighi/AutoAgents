@@ -29,6 +29,27 @@
       "route": "workspace_metadata",
       "query": "workspace crate metadata",
       "expected_signal": "crate_root is '.' for root crate"
+    },
+    {
+      "id": "file_context_lib",
+      "task_type": "file_context_lookup",
+      "route": "get_file_context",
+      "query": "src/lib.rs",
+      "expected_signal": "returns file_doc and attached symbols/edges for src/lib.rs"
+    },
+    {
+      "id": "search_type_edges_rule",
+      "task_type": "type_edge_lookup",
+      "route": "search_types",
+      "query": "Rule definitions",
+      "expected_signal": "returns type edges for Rule-related definitions/implementations"
+    },
+    {
+      "id": "search_file_docs_smoke",
+      "task_type": "file_doc_lookup",
+      "route": "search_files",
+      "query": "tests smoke",
+      "expected_signal": "returns tests/smoke.rs file-level doc"
     }
   ]
 }
