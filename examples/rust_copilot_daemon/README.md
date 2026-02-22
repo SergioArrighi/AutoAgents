@@ -93,6 +93,7 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 
 - Ingestion is queue-based, with debounce + batch processing for file-change storms.
 - Query plane is read-only and returns `indexing_in_progress`.
+- `search_relations` uses semantic retrieval plus intent-aware reranking: query terms like `implements`, `defined`, `references`, and `type definition` boost matching relation kinds.
 - JSON-RPC returns `{protocol_version, daemon_version}` on initialize.
 - MCP responses include `schema_version`.
 - HTTP binds only to `127.0.0.1`.

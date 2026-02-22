@@ -1465,6 +1465,10 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         file_metrics.implementations_failed = 0;
         file_metrics.implementations_nonempty = 0;
         file_metrics.relations_implementations_emitted = 0;
+        file_metrics.type_definitions_success = 0;
+        file_metrics.type_definitions_failed = 0;
+        file_metrics.type_definitions_nonempty = 0;
+        file_metrics.relations_type_definitions_emitted = 0;
         let requeue_needed = {
             let mut state = app.state.write().await;
             if state.is_ra_warm_impl {
@@ -2138,13 +2142,12 @@ fn load_workspace_metadata(root: &Path) -> Result<WorkspaceMetadata> {
             .and_then(|v| v.as_str())
             .unwrap_or("2021")
             .to_string();
-        let crate_root = manifest_path
+        let crate_root_rel = manifest_path
             .parent()
             .unwrap_or(root)
             .strip_prefix(root)
-            .unwrap_or_else(|_| Path::new(""))
-            .to_string_lossy()
-            .to_string();
+            .unwrap_or_else(|_| Path::new("."));
+        let crate_root = normalize_crate_root(crate_root_rel);
         let manifest_rel = manifest_path
             .strip_prefix(root)
             .unwrap_or(manifest_path.as_path())
@@ -2195,6 +2198,14 @@ fn collect_optional_dependencies(value: &toml::Value) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+fn normalize_crate_root(path: &Path) -> String {
+    if path.as_os_str().is_empty() || path == Path::new(".") {
+        ".".to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    }
 }
 
 async fn extract_symbol_relations_with_lsp(
@@ -2359,8 +2370,15 @@ async fn extract_symbol_relations_with_lsp(
                 )
                 .await;
             if let Ok(Some(type_definitions)) = type_definitions {
+                let primary_location_count = lsp_locations_from_value(&type_definitions).len();
+                if should_debug_missing_type_definition_symbol(doc) {
+                    eprintln!(
+                        "[type-def-focus] file={} symbol={} kind={} stage=primary locations={}",
+                        doc.file_path, doc.symbol, doc.kind, primary_location_count
+                    );
+                }
                 metrics.type_definitions_success += 1;
-                let emitted = append_relation_targets(
+                let mut emitted = append_relation_targets(
                     &mut out,
                     &mut seen,
                     &mut cache,
@@ -2373,6 +2391,66 @@ async fn extract_symbol_relations_with_lsp(
                     &source_lines,
                 )
                 .await?;
+                if emitted == 0
+                    && let Some((usage_line, usage_character)) =
+                        symbol_usage_position_in_file(
+                            &source_lines,
+                            &doc.symbol,
+                            doc.start_line,
+                            doc.end_line,
+                        )
+                {
+                    eprintln!(
+                        "[type-def-debug] file={} symbol={} kind={} fallback=usage_pos query_pos={}:{}",
+                        doc.file_path, doc.symbol, doc.kind, usage_line, usage_character
+                    );
+                    let usage_type_definitions = session
+                        .request_if_supported(
+                            "textDocument/typeDefinition",
+                            json!({
+                                "textDocument": { "uri": file_uri },
+                                "position": {
+                                    "line": usage_line.saturating_sub(1),
+                                    "character": usage_character
+                                }
+                            }),
+                            LSP_HEAVY_REQUEST_TIMEOUT,
+                            LSP_CONTENT_MODIFIED_RETRIES,
+                        )
+                        .await;
+                    if let Ok(Some(payload)) = usage_type_definitions {
+                        let usage_location_count = lsp_locations_from_value(&payload).len();
+                        if should_debug_missing_type_definition_symbol(doc) {
+                            eprintln!(
+                                "[type-def-focus] file={} symbol={} kind={} stage=usage_fallback locations={} query_pos={}:{}",
+                                doc.file_path,
+                                doc.symbol,
+                                doc.kind,
+                                usage_location_count,
+                                usage_line,
+                                usage_character
+                            );
+                        }
+                        emitted += append_relation_targets(
+                            &mut out,
+                            &mut seen,
+                            &mut cache,
+                            workspace_root,
+                            workspace_id,
+                            file_path_rel,
+                            doc,
+                            "type_definitions",
+                            payload,
+                            &source_lines,
+                        )
+                        .await?;
+                    } else if let Err(err) = usage_type_definitions {
+                        eprintln!(
+                            "[type-def-debug] file={} symbol={} kind={} fallback=usage_pos result=error error={:#}",
+                            doc.file_path, doc.symbol, doc.kind, err
+                        );
+                    }
+                }
                 eprintln!(
                     "[type-def-debug] file={} symbol={} kind={} result=ok emitted={}",
                     doc.file_path, doc.symbol, doc.kind, emitted
@@ -2729,6 +2807,10 @@ fn should_request_implementations_for_symbol(doc: &RustItemDoc) -> bool {
 
 fn should_request_type_definitions_for_symbol(doc: &RustItemDoc) -> bool {
     matches!(doc.kind.as_str(), "trait" | "struct" | "enum")
+}
+
+fn should_debug_missing_type_definition_symbol(doc: &RustItemDoc) -> bool {
+    matches!(doc.symbol.as_str(), "Rule" | "ValueState")
 }
 
 fn lsp_hover_to_text(result: &Value) -> Option<String> {
@@ -3244,7 +3326,9 @@ fn find_crate_metadata_for_file<'a>(
 ) -> Option<&'a CrateMetadataDoc> {
     metadata_by_crate
         .iter()
-        .filter(|(root, _)| root.is_empty() || file_path.starts_with(root.as_str()))
+        .filter(|(root, _)| {
+            root.is_empty() || root.as_str() == "." || file_path.starts_with(root.as_str())
+        })
         .max_by_key(|(root, _)| root.len())
         .map(|(_, doc)| doc)
 }
@@ -3440,6 +3524,41 @@ fn symbol_position_in_lsp_range(
 
     for idx in start_idx..=end_idx {
         let line = lines[idx];
+        for (byte_idx, _) in line.match_indices(symbol) {
+            if symbol_match_is_isolated(line, byte_idx, symbol.len()) {
+                return Some((idx + 1, utf16_character_offset(line, byte_idx)));
+            }
+        }
+    }
+
+    None
+}
+
+fn symbol_usage_position_in_file(
+    lines: &[&str],
+    symbol: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<(usize, usize)> {
+    if lines.is_empty() || symbol.is_empty() {
+        return None;
+    }
+
+    let start_idx = start_line
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
+    let end_idx = end_line
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
+
+    for (idx, line) in lines.iter().enumerate() {
+        if idx >= start_idx && idx <= end_idx {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
         for (byte_idx, _) in line.match_indices(symbol) {
             if symbol_match_is_isolated(line, byte_idx, symbol.len()) {
                 return Some((idx + 1, utf16_character_offset(line, byte_idx)));
@@ -3681,6 +3800,49 @@ pub struct Thing {
             .find(|doc| doc.symbol == "run_default")
             .expect("run_default symbol should be indexed");
         assert_eq!(run_default.start_line, 12);
+    }
+
+    #[test]
+    fn normalize_crate_root_maps_workspace_root_to_dot() {
+        assert_eq!(normalize_crate_root(Path::new("")), ".");
+        assert_eq!(normalize_crate_root(Path::new(".")), ".");
+        assert_eq!(normalize_crate_root(Path::new("crates/core")), "crates/core");
+    }
+
+    #[test]
+    fn find_crate_metadata_for_file_supports_dot_root() {
+        let root_doc = CrateMetadataDoc {
+            id: "metadata:ws_test:.".to_string(),
+            workspace_id: "ws_test".to_string(),
+            crate_name: "root".to_string(),
+            edition: "2021".to_string(),
+            crate_root: ".".to_string(),
+            manifest_path: "Cargo.toml".to_string(),
+            features: Vec::new(),
+            optional_dependencies: Vec::new(),
+        };
+        let nested_doc = CrateMetadataDoc {
+            id: "metadata:ws_test:crates/nested".to_string(),
+            workspace_id: "ws_test".to_string(),
+            crate_name: "nested".to_string(),
+            edition: "2021".to_string(),
+            crate_root: "crates/nested".to_string(),
+            manifest_path: "crates/nested/Cargo.toml".to_string(),
+            features: Vec::new(),
+            optional_dependencies: Vec::new(),
+        };
+
+        let mut metadata_by_crate = HashMap::new();
+        metadata_by_crate.insert(root_doc.crate_root.clone(), root_doc);
+        metadata_by_crate.insert(nested_doc.crate_root.clone(), nested_doc);
+
+        let nested = find_crate_metadata_for_file(&metadata_by_crate, "crates/nested/src/lib.rs")
+            .expect("nested crate metadata should resolve");
+        assert_eq!(nested.crate_name, "nested");
+
+        let root = find_crate_metadata_for_file(&metadata_by_crate, "src/main.rs")
+            .expect("root crate metadata should resolve");
+        assert_eq!(root.crate_name, "root");
     }
 
     #[test]

@@ -271,13 +271,14 @@ async fn handle_mcp_search_relations(
         .clone()
         .unwrap_or_else(|| SYMBOL_VECTOR_NAME.to_string());
     let default_workspace_id = app.config.read().await.workspace_id.clone();
+    let semantic_samples = (top_k.saturating_mul(4)).clamp(top_k, 64);
 
     let semantic = {
         let services = app.services.read().await.clone();
         let request = VectorSearchRequest::builder()
             .query(req.query.clone())
             .query_vector_name(vector_name.clone())
-            .samples(top_k as u64)
+            .samples(semantic_samples as u64)
             .build()
             .map_err(|err| RpcError {
                 code: 400,
@@ -303,8 +304,8 @@ async fn handle_mcp_search_relations(
                 None
             }
         })
-        .take(top_k)
         .collect::<Vec<_>>();
+    let rows = rerank_relation_results(&req.query, rows, top_k);
 
     let state = app.state.read().await;
     Ok(json!({
@@ -356,6 +357,103 @@ pub(super) fn lexical_search(
 
 fn resolve_limit(limit: Option<usize>, top_k: Option<usize>, default: usize) -> usize {
     limit.or(top_k).unwrap_or(default).max(1)
+}
+
+fn rerank_relation_results(
+    query: &str,
+    mut rows: Vec<(f64, SymbolRelationDoc)>,
+    top_k: usize,
+) -> Vec<(f64, SymbolRelationDoc)> {
+    let intent_kind = infer_relation_intent_kind(query);
+    let query_tokens = query_tokens(query);
+
+    rows.sort_by(|(left_score, left_item), (right_score, right_item)| {
+        let left = relation_relevance_score(*left_score, left_item, intent_kind, &query_tokens);
+        let right =
+            relation_relevance_score(*right_score, right_item, intent_kind, &query_tokens);
+        right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left_item.id.cmp(&right_item.id))
+    });
+    rows.truncate(top_k);
+    rows
+}
+
+fn relation_relevance_score(
+    base_score: f64,
+    item: &SymbolRelationDoc,
+    intent_kind: Option<&'static str>,
+    query_tokens: &HashSet<String>,
+) -> f64 {
+    const INTENT_KIND_BOOST: f64 = 0.12;
+    const SOURCE_SYMBOL_BOOST: f64 = 0.05;
+
+    let mut boosted = base_score;
+    if intent_kind.is_some_and(|kind| item.relation_kind == kind) {
+        boosted += INTENT_KIND_BOOST;
+    }
+    if source_symbol_token_overlap(item, query_tokens) {
+        boosted += SOURCE_SYMBOL_BOOST;
+    }
+    boosted
+}
+
+fn infer_relation_intent_kind(query: &str) -> Option<&'static str> {
+    let tokens = query_tokens(query);
+
+    let has = |needle: &[&str]| needle.iter().any(|term| tokens.contains(*term));
+    let has_type = has(&["type", "types", "typedef", "typedefs"]);
+    let has_definition = has(&["definition", "definitions", "define", "defined"]);
+
+    if has_type && has_definition || has(&["type_definition", "type_definitions"]) {
+        Some("type_definitions")
+    } else if has(&[
+        "implement",
+        "implements",
+        "implemented",
+        "implementation",
+        "implementations",
+        "impl",
+    ]) {
+        Some("implementations")
+    } else if has_definition {
+        Some("definitions")
+    } else if has(&[
+        "reference",
+        "references",
+        "referenced",
+        "usage",
+        "usages",
+        "used",
+        "calls",
+        "called",
+        "callers",
+    ]) {
+        Some("references")
+    } else {
+        None
+    }
+}
+
+fn query_tokens(query: &str) -> HashSet<String> {
+    query
+        .to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect::<HashSet<_>>()
+}
+
+fn source_symbol_token_overlap(item: &SymbolRelationDoc, query_tokens: &HashSet<String>) -> bool {
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let source_symbol = item.source_symbol.to_lowercase();
+    query_tokens
+        .iter()
+        .filter(|token| token.len() >= 3)
+        .any(|token| source_symbol.contains(token.as_str()))
 }
 
 /// Applies optional search filters to a chunk.
@@ -895,6 +993,38 @@ mod tests {
         assert!(scores.get("rule").copied().unwrap_or_default() >= 2.0);
         assert!(fields.contains_key("rule"));
         assert!(!fields.contains_key("engine"));
+    }
+
+    #[test]
+    fn infer_relation_intent_kind_detects_implementations() {
+        assert_eq!(
+            infer_relation_intent_kind("PositiveRule implements Rule"),
+            Some("implementations")
+        );
+        assert_eq!(
+            infer_relation_intent_kind("where is Rule defined"),
+            Some("definitions")
+        );
+        assert_eq!(
+            infer_relation_intent_kind("type definition for Rule"),
+            Some("type_definitions")
+        );
+    }
+
+    #[test]
+    fn rerank_relation_results_prefers_intent_matching_kind() {
+        let mut definition = relation_doc("PositiveRule", "relation:def");
+        definition.id = "relation:def".to_string();
+        definition.relation_kind = "definitions".to_string();
+
+        let mut implementation = relation_doc("PositiveRule", "relation:impl");
+        implementation.id = "relation:impl".to_string();
+        implementation.relation_kind = "implementations".to_string();
+
+        let rows = vec![(0.70, definition), (0.66, implementation)];
+        let reranked = rerank_relation_results("PositiveRule implements Rule", rows, 2);
+
+        assert_eq!(reranked.first().map(|(_, item)| item.relation_kind.as_str()), Some("implementations"));
     }
 }
 
