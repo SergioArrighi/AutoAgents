@@ -124,11 +124,15 @@ curl -s -X POST http://127.0.0.1:43891/mcp/tools/search_code \
 - `search_relations` uses semantic retrieval plus intent-aware reranking: query terms like `implements`, `defined`, `references`, and `type definition` boost matching relation kinds.
 - MCP responses now emit canonical schema payloads (`SymbolDoc` / typed graph edge docs).
 - Canonical indexing schema includes `SymbolDoc`, `FileDoc`, typed graph edges, and `DiagnosticDoc`.
+- Diagnostic indexing is sourced from rust-analyzer `textDocument/publishDiagnostics` notifications and stores only the latest pass per file (no historical retention).
 - Additional artifact entities are indexed from rust-analyzer when supported: `SemanticTokenDoc`, `SyntaxTreeDoc`, `InlayHintDoc`, `CrateGraphDoc`.
 - `search_syntax_artifacts` degrades gracefully when the syntax collection is not initialized yet (for example when `rust-analyzer/viewSyntaxTree` is unsupported): it returns an empty result set plus `availability.reason = syntax_collection_not_initialized` instead of a hard error.
 - Syntax artifact extraction/indexing is feature-flagged via `config.enableSyntaxArtifacts` (or env `ENABLE_SYNTAX_ARTIFACTS`); default is `false`.
 - JSON-RPC returns `{protocol_version, daemon_version}` on initialize.
 - MCP responses include `schema_version`.
+- `index_status` includes diagnostics observability:
+  - `diagnostics_active_count` (current in-memory latest-pass diagnostics total).
+  - `extraction_metrics.diagnostics_indexed_total` (cumulative diagnostics indexed).
 - HTTP binds only to `127.0.0.1`.
 - MCP bind port comes from `MCP_PORT` (default `0`, meaning OS-assigned ephemeral port).
 - rust-analyzer integration is session-based (persistent process per workspace) with `didOpen`/`didChange`/`didClose`.
