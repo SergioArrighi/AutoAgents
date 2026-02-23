@@ -55,6 +55,12 @@ pub(crate) struct SymbolDoc {
     pub(crate) body_hash: String,
     #[serde(default)]
     pub(crate) symbol_id_stable: String,
+    #[serde(default)]
+    pub(crate) semantic_tokens_summary: String,
+    #[serde(default)]
+    pub(crate) syntax_tree_summary: String,
+    #[serde(default)]
+    pub(crate) inlay_hints_summary: String,
 }
 
 impl SymbolDoc {
@@ -237,6 +243,52 @@ pub(crate) struct DiagnosticDoc {
     pub(crate) span: Span,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct SemanticTokenDoc {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) file_path: String,
+    pub(crate) uri: String,
+    pub(crate) symbol_id: Option<String>,
+    pub(crate) token_count: usize,
+    pub(crate) token_type_histogram: Vec<String>,
+    pub(crate) summary: String,
+    pub(crate) span: Span,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct SyntaxTreeDoc {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) file_path: String,
+    pub(crate) uri: String,
+    pub(crate) symbol_id: Option<String>,
+    pub(crate) node_kind_histogram: Vec<String>,
+    pub(crate) summary: String,
+    pub(crate) span: Span,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct InlayHintDoc {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) file_path: String,
+    pub(crate) uri: String,
+    pub(crate) symbol_id: Option<String>,
+    pub(crate) hint_count: usize,
+    pub(crate) summary: String,
+    pub(crate) span: Span,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct CrateGraphDoc {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) crate_name: String,
+    pub(crate) crate_root: String,
+    pub(crate) summary: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,14 +307,8 @@ mod tests {
     fn infer_signature_parts() {
         let sig = "pub fn run<T>(self, value: T) -> Result<T, E> where T: Clone {";
         assert_eq!(infer_generics(sig, "run"), Some("<T>".to_string()));
-        assert_eq!(
-            infer_where_clause(sig),
-            Some("where T: Clone".to_string())
-        );
+        assert_eq!(infer_where_clause(sig), Some("where T: Clone".to_string()));
         assert_eq!(infer_receiver(sig), Some("self".to_string()));
-        assert_eq!(
-            infer_return_type(sig),
-            Some("Result<T, E>".to_string())
-        );
+        assert_eq!(infer_return_type(sig), Some("Result<T, E>".to_string()));
     }
 }

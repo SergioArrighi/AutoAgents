@@ -5,6 +5,8 @@
 
 /// Engine entry points used by tests and fixture scanners.
 pub mod engine;
+/// Syntax-heavy helpers used to stress syntax artifact extraction.
+pub mod syntax_playground;
 /// Shared types and classification helpers used by the engine.
 pub mod types;
 

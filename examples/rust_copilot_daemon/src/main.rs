@@ -36,12 +36,17 @@ const SIGNATURE_VECTOR_NAME: &str = "signature";
 const BODY_VECTOR_NAME: &str = "body";
 const TYPE_VECTOR_NAME: &str = "type";
 const GRAPH_VECTOR_NAME: &str = "graph";
+const SEMANTIC_VECTOR_NAME: &str = "semantic";
+const SYNTAX_VECTOR_NAME: &str = "syntax";
+const EMBED_OVERSIZE_DEBUG_CHARS: usize = 12_000;
+const EMBED_HARD_CAP_CHARS: usize = 8_000;
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const LSP_HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const LSP_CONTENT_MODIFIED_RETRIES: usize = 1;
 const LSP_WORK_DONE_SETTLE_TIMEOUT: Duration = Duration::from_millis(700);
 const LSP_WORK_DONE_POLL_INTERVAL: Duration = Duration::from_millis(60);
 const BULK_SCAN_QUEUE_DEPTH_THRESHOLD: usize = 32;
+const WORKSPACE_REFRESH_MAX_RETRIES: u8 = 3;
 
 /// Runtime configuration shared across JSON-RPC and MCP layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +71,14 @@ struct RuntimeConfig {
     qdrant_type_edge_collection: String,
     /// Qdrant collection name for diagnostic documents.
     qdrant_diagnostic_collection: String,
+    /// Qdrant collection name for semantic token artifacts.
+    qdrant_semantic_collection: String,
+    /// Qdrant collection name for syntax tree artifacts.
+    qdrant_syntax_collection: String,
+    /// Qdrant collection name for inlay hint artifacts.
+    qdrant_inlay_collection: String,
+    /// Qdrant collection name for crate graph artifacts.
+    qdrant_crate_graph_collection: String,
     /// Optional Qdrant API key.
     qdrant_api_key: Option<String>,
     /// Ollama endpoint URL.
@@ -76,6 +89,8 @@ struct RuntimeConfig {
     embedding_model: String,
     /// MCP HTTP bind port (`0` means ephemeral).
     mcp_port: u16,
+    /// Enables syntax artifact extraction/indexing (`viewSyntaxTree` channel).
+    enable_syntax_artifacts: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -101,12 +116,21 @@ impl Default for RuntimeConfig {
                 .unwrap_or_else(|_| "rust_copilot_types".to_string()),
             qdrant_diagnostic_collection: std::env::var("QDRANT_DIAGNOSTIC_COLLECTION")
                 .unwrap_or_else(|_| "rust_copilot_diagnostics".to_string()),
+            qdrant_semantic_collection: std::env::var("QDRANT_SEMANTIC_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_semantic_artifacts".to_string()),
+            qdrant_syntax_collection: std::env::var("QDRANT_SYNTAX_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_syntax_artifacts".to_string()),
+            qdrant_inlay_collection: std::env::var("QDRANT_INLAY_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_inlay_artifacts".to_string()),
+            qdrant_crate_graph_collection: std::env::var("QDRANT_CRATE_GRAPH_COLLECTION")
+                .unwrap_or_else(|_| "rust_copilot_crate_graph".to_string()),
             qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
             llm_model: "gpt-oss:20b".to_string(),
             embedding_model: "dengcao/Qwen3-Embedding-8B:Q4_K_M".to_string(),
             mcp_port: parse_env_u16("MCP_PORT").unwrap_or(0),
+            enable_syntax_artifacts: parse_env_bool("ENABLE_SYNTAX_ARTIFACTS").unwrap_or(false),
         }
     }
 }
@@ -116,6 +140,15 @@ fn parse_env_u16(name: &str) -> Option<u16> {
     match raw.parse::<u16>() {
         Ok(value) => Some(value),
         Err(_) => None,
+    }
+}
+
+fn parse_env_bool(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -154,7 +187,6 @@ impl Embed for CodeChunk {
     }
 }
 
-
 impl Embed for schema::SymbolDoc {
     fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
         embedder.embed(rust_item_search_text(self));
@@ -165,6 +197,34 @@ impl Embed for schema::SymbolDoc {
 impl Embed for schema::GraphEdgeDoc {
     fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
         embedder.embed(relation_search_text(self));
+        Ok(())
+    }
+}
+
+impl Embed for schema::SemanticTokenDoc {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
+        embedder.embed(semantic_artifact_search_text(self));
+        Ok(())
+    }
+}
+
+impl Embed for schema::SyntaxTreeDoc {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
+        embedder.embed(syntax_artifact_search_text(self));
+        Ok(())
+    }
+}
+
+impl Embed for schema::InlayHintDoc {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
+        embedder.embed(inlay_artifact_search_text(self));
+        Ok(())
+    }
+}
+
+impl Embed for schema::CrateGraphDoc {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
+        embedder.embed(crate_graph_search_text(self));
         Ok(())
     }
 }
@@ -263,6 +323,22 @@ struct ExtractionMetrics {
     relations_type_definitions_emitted_total: u64,
     content_modified_retries_total: u64,
     request_timeouts_total: u64,
+    semantic_tokens_success_total: u64,
+    semantic_tokens_failed_total: u64,
+    semantic_tokens_nonempty_total: u64,
+    syntax_tree_success_total: u64,
+    syntax_tree_failed_total: u64,
+    syntax_tree_nonempty_total: u64,
+    syntax_tree_unsupported_total: u64,
+    inlay_hints_success_total: u64,
+    inlay_hints_failed_total: u64,
+    inlay_hints_nonempty_total: u64,
+    workspace_refresh_requeued_total: u64,
+    crate_graph_transient_requeued_total: u64,
+    crate_graph_unsupported_total: u64,
+    crate_graph_success_total: u64,
+    crate_graph_failed_total: u64,
+    crate_graph_nonempty_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -296,6 +372,16 @@ struct FileExtractionMetrics {
     relations_type_definitions_emitted: u64,
     content_modified_retries: u64,
     request_timeouts: u64,
+    semantic_tokens_success: u64,
+    semantic_tokens_failed: u64,
+    semantic_tokens_nonempty: u64,
+    syntax_tree_success: u64,
+    syntax_tree_failed: u64,
+    syntax_tree_nonempty: u64,
+    syntax_tree_unsupported: u64,
+    inlay_hints_success: u64,
+    inlay_hints_failed: u64,
+    inlay_hints_nonempty: u64,
 }
 
 /// Mutable daemon state shared by both planes.
@@ -315,6 +401,14 @@ struct State {
     type_edges_by_file: HashMap<String, Vec<schema::TypeEdge>>,
     /// Local in-memory diagnostics by file path.
     diagnostics_by_file: HashMap<String, Vec<schema::DiagnosticDoc>>,
+    /// Local in-memory semantic-token artifacts by file path.
+    semantic_tokens_by_file: HashMap<String, Vec<schema::SemanticTokenDoc>>,
+    /// Local in-memory syntax-tree artifacts by file path.
+    syntax_trees_by_file: HashMap<String, Vec<schema::SyntaxTreeDoc>>,
+    /// Local in-memory inlay-hint artifacts by file path.
+    inlay_hints_by_file: HashMap<String, Vec<schema::InlayHintDoc>>,
+    /// Local in-memory crate graph artifacts by crate root.
+    crate_graph_by_crate: HashMap<String, schema::CrateGraphDoc>,
     /// Count of pending indexing events.
     queue_depth: usize,
     /// Whether worker is currently indexing.
@@ -335,18 +429,34 @@ struct State {
     indexed_type_edge_ids_by_file: HashMap<String, HashSet<String>>,
     /// Currently indexed diagnostic IDs by file, used for incremental cleanup.
     indexed_diagnostic_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed semantic-token IDs by file, used for incremental cleanup.
+    indexed_semantic_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed syntax-tree IDs by file, used for incremental cleanup.
+    indexed_syntax_ids_by_file: HashMap<String, HashSet<String>>,
+    /// Currently indexed inlay-hint IDs by file, used for incremental cleanup.
+    indexed_inlay_ids_by_file: HashMap<String, HashSet<String>>,
     /// Parsed workspace metadata snapshot.
     workspace_metadata: Option<WorkspaceMetadata>,
     /// Indexed metadata docs by crate root.
     metadata_docs_by_crate: HashMap<String, CrateMetadataDoc>,
     /// Logical IDs for metadata docs in vector store.
     indexed_metadata_ids: HashSet<String>,
+    /// Logical IDs for crate graph docs in vector store.
+    indexed_crate_graph_ids: HashSet<String>,
     /// Aggregated extraction metrics.
     extraction_metrics: ExtractionMetrics,
     /// True after a post-initialize warm-up extraction has completed.
     is_ra_warm: bool,
     /// True after first implementation extraction pass has been discarded/requeued.
     is_ra_warm_impl: bool,
+    /// True once crate-graph extraction has passed first-call warmup.
+    is_ra_warm_crate_graph: bool,
+    /// Number of consecutive crate-graph refresh retries.
+    workspace_refresh_retry_count: u8,
+    /// Set after first scan.full; graph refresh is triggered when queue drains.
+    pending_initial_graph_refresh: bool,
+    /// Guards one-time deferred graph refresh per workspace lifecycle.
+    initial_graph_refresh_done: bool,
 }
 
 impl State {
@@ -395,6 +505,14 @@ struct Services {
     type_edge_store: QdrantVectorStore,
     /// Dedicated vector store for diagnostics.
     diagnostic_store: QdrantVectorStore,
+    /// Dedicated vector store for semantic-token artifacts.
+    semantic_store: QdrantVectorStore,
+    /// Dedicated vector store for syntax-tree artifacts.
+    syntax_store: QdrantVectorStore,
+    /// Dedicated vector store for inlay-hint artifacts.
+    inlay_store: QdrantVectorStore,
+    /// Dedicated vector store for crate-graph artifacts.
+    crate_graph_store: QdrantVectorStore,
 }
 
 /// Root application context injected into all tasks and handlers.
@@ -422,6 +540,8 @@ enum DirtyEvent {
     Index(PathBuf),
     /// Delete file chunks from in-memory view.
     Delete(PathBuf),
+    /// Refresh workspace-level graph artifacts.
+    RefreshWorkspace,
 }
 
 struct RaSessionManager {
@@ -489,19 +609,15 @@ impl RaSessionManager {
             )
             .await?
         else {
-            eprintln!(
-                "[fallback-debug] file={} reason=documentSymbol_unsupported_or_none",
-                file_path_rel
-            );
             return Ok(Vec::new());
         };
-        let mut docs = parse_lsp_symbols(result, workspace_id, file_path_rel, &file_uri, content);
-        if docs.is_empty() {
-            eprintln!(
-                "[fallback-debug] file={} reason=documentSymbol_empty_after_parse",
-                file_path_rel
-            );
-        }
+        let mut docs = parse_lsp_symbols(
+            result.clone(),
+            workspace_id,
+            file_path_rel,
+            &file_uri,
+            content,
+        );
         enrich_docs_with_lsp_metadata(session, &file_uri, content, &mut docs, bulk_mode, metrics)
             .await?;
         for doc in &mut docs {
@@ -547,12 +663,189 @@ impl RaSessionManager {
         Ok(relations)
     }
 
+    async fn extract_file_artifacts(
+        &mut self,
+        workspace_root: &Path,
+        workspace_id: &str,
+        file_path_rel: &str,
+        file_uri: &str,
+        content: &str,
+        docs: &[schema::SymbolDoc],
+        enable_syntax_artifacts: bool,
+        metrics: &mut FileExtractionMetrics,
+    ) -> Result<(
+        Vec<schema::SemanticTokenDoc>,
+        Vec<schema::SyntaxTreeDoc>,
+        Vec<schema::InlayHintDoc>,
+    )> {
+        let session = self.ensure_session(workspace_root).await?;
+        session.sync_document(file_uri, content).await?;
+        extract_lsp_artifact_docs(
+            session,
+            workspace_id,
+            file_path_rel,
+            file_uri,
+            content,
+            docs,
+            enable_syntax_artifacts,
+            metrics,
+        )
+        .await
+    }
+
+    async fn extract_crate_graph_doc(
+        &mut self,
+        workspace_root: &Path,
+        workspace_id: &str,
+        crate_name: &str,
+        crate_root: &str,
+    ) -> Result<Option<schema::CrateGraphDoc>> {
+        let session = self.ensure_session(workspace_root).await?;
+        let Some(payload) = session
+            .request_if_supported(
+                "rust-analyzer/viewCrateGraph",
+                json!({ "full": true }),
+                LSP_HEAVY_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let summary = summarize_crate_graph_payload(&payload, crate_name);
+        if summary.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(schema::CrateGraphDoc {
+            id: format!("crate_graph:{workspace_id}:{crate_root}"),
+            workspace_id: workspace_id.to_string(),
+            crate_name: crate_name.to_string(),
+            crate_root: crate_root.to_string(),
+            summary,
+        }))
+    }
+
     fn session_counters(&self) -> RaSessionCounters {
         self.session
             .as_ref()
             .map(RaLspSession::counters)
             .unwrap_or_default()
     }
+}
+
+fn summarize_crate_graph_payload(payload: &Value, crate_name: &str) -> String {
+    let raw = payload
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| payload.to_string());
+
+    let mut node_labels = HashMap::<String, String>::new();
+    let mut edges = Vec::<(String, String)>::new();
+
+    for line in raw.lines().map(str::trim) {
+        if let Some((node_id, label)) = parse_dot_node_line(line) {
+            node_labels.insert(node_id.to_string(), label.to_string());
+            continue;
+        }
+        if let Some((src, dst)) = parse_dot_edge_line(line) {
+            edges.push((src.to_string(), dst.to_string()));
+        }
+    }
+
+    let nodes_total = node_labels.len();
+    let edges_total = edges.len();
+    let Some(crate_node_id) = node_labels
+        .iter()
+        .find_map(|(node_id, label)| (label == crate_name).then_some(node_id.clone()))
+    else {
+        return format!(
+            "crate: {crate}\nnode_found: false\nnodes_total: {nodes}\nedges_total: {edges}",
+            crate = crate_name,
+            nodes = nodes_total,
+            edges = edges_total
+        );
+    };
+
+    let mut outbound = edges
+        .iter()
+        .filter_map(|(src, dst)| {
+            (src == &crate_node_id)
+                .then(|| node_labels.get(dst).cloned())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    outbound.sort();
+    outbound.dedup();
+
+    let mut inbound = edges
+        .iter()
+        .filter_map(|(src, dst)| {
+            (dst == &crate_node_id)
+                .then(|| node_labels.get(src).cloned())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    inbound.sort();
+    inbound.dedup();
+
+    format!(
+        "crate: {crate}\nnode_found: true\nnodes_total: {nodes}\nedges_total: {edges}\noutbound_deps_count: {out_count}\noutbound_deps: {outbound}\ninbound_deps_count: {in_count}\ninbound_deps: {inbound}",
+        crate = crate_name,
+        nodes = nodes_total,
+        edges = edges_total,
+        out_count = outbound.len(),
+        outbound = join_limited(&outbound, 24),
+        in_count = inbound.len(),
+        inbound = join_limited(&inbound, 24),
+    )
+}
+
+fn parse_dot_node_line(line: &str) -> Option<(&str, &str)> {
+    let id_end = line.find('[')?;
+    let node_id = line[..id_end].trim();
+    if node_id.is_empty() {
+        return None;
+    }
+    let (label_start, terminator) = if let Some(idx) = line.find("label=\"") {
+        (idx + "label=\"".len(), "\"")
+    } else {
+        let idx = line.find("label=\\\"")?;
+        (idx + "label=\\\"".len(), "\\\"")
+    };
+    let rest = &line[label_start..];
+    let label_end = rest.find(terminator)?;
+    let label = &rest[..label_end];
+    Some((node_id, label))
+}
+
+fn parse_dot_edge_line(line: &str) -> Option<(&str, &str)> {
+    let arrow = line.find("->")?;
+    let src = line[..arrow].trim();
+    if src.is_empty() {
+        return None;
+    }
+    let rest = line[(arrow + 2)..].trim_start();
+    let dst_end = rest
+        .find('[')
+        .or_else(|| rest.find(';'))
+        .unwrap_or(rest.len());
+    let dst = rest[..dst_end].trim();
+    if dst.is_empty() {
+        return None;
+    }
+    Some((src, dst))
+}
+
+fn join_limited(items: &[String], max_items: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    if items.len() <= max_items {
+        return items.join(",");
+    }
+    let mut out = items[..max_items].join(",");
+    out.push_str(",...");
+    out
 }
 
 struct RaLspSession {
@@ -738,6 +1031,12 @@ impl RaLspSession {
         {
             Ok(v) => Ok(Some(v)),
             Err(err) if is_method_unsupported_error(&err) => {
+                if method == "rust-analyzer/viewSyntaxTree" {
+                    eprintln!(
+                        "[syntax-tree-debug] method=rust-analyzer/viewSyntaxTree first_unsupported_response={:#}",
+                        err
+                    );
+                }
                 self.unsupported_methods.insert(method.to_string());
                 Ok(None)
             }
@@ -846,6 +1145,16 @@ fn is_content_modified_error(err: &anyhow::Error) -> bool {
     message.contains("\"code\":-32801") || message.contains("content modified")
 }
 
+fn is_transient_lsp_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    is_content_modified_error(err)
+        || message.contains("request timed out")
+        || message.contains("\"code\":-32800")
+        || message.contains("\"code\":-32802")
+        || message.contains("server cancelled")
+        || message.contains("canceled")
+}
+
 fn is_method_unsupported_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
     message.contains("\"code\":-32601")
@@ -901,6 +1210,14 @@ struct InitializeParams {
     type_edge_collection: Option<String>,
     #[serde(rename = "diagnosticCollection")]
     diagnostic_collection: Option<String>,
+    #[serde(rename = "semanticCollection")]
+    semantic_collection: Option<String>,
+    #[serde(rename = "syntaxCollection")]
+    syntax_collection: Option<String>,
+    #[serde(rename = "inlayCollection")]
+    inlay_collection: Option<String>,
+    #[serde(rename = "crateGraphCollection")]
+    crate_graph_collection: Option<String>,
     config: Option<InitializeConfig>,
 }
 
@@ -917,6 +1234,8 @@ struct InitializeConfig {
     qdrant_api_key: Option<String>,
     #[serde(rename = "workspaceId")]
     workspace_id: Option<String>,
+    #[serde(rename = "enableSyntaxArtifacts")]
+    enable_syntax_artifacts: Option<bool>,
 }
 
 /// `scan.full` params.
@@ -1092,6 +1411,60 @@ struct SearchDiagnosticsRequest {
     filters: Option<DiagnosticSearchFilters>,
 }
 
+/// `search_semantic_artifacts` request body.
+#[derive(Debug, Deserialize)]
+struct SearchSemanticArtifactsRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<SemanticArtifactSearchFilters>,
+}
+
+/// Optional filters accepted by `search_semantic_artifacts`.
+#[derive(Debug, Deserialize)]
+struct SemanticArtifactSearchFilters {
+    workspace_id: Option<String>,
+    file_path: Option<String>,
+    symbol_id: Option<String>,
+}
+
+/// `search_syntax_artifacts` request body.
+#[derive(Debug, Deserialize)]
+struct SearchSyntaxArtifactsRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<SyntaxArtifactSearchFilters>,
+}
+
+/// Optional filters accepted by `search_syntax_artifacts`.
+#[derive(Debug, Deserialize)]
+struct SyntaxArtifactSearchFilters {
+    workspace_id: Option<String>,
+    file_path: Option<String>,
+    symbol_id: Option<String>,
+}
+
+/// `search_crate_graph` request body.
+#[derive(Debug, Deserialize)]
+struct SearchCrateGraphRequest {
+    query: String,
+    limit: Option<usize>,
+    top_k: Option<usize>,
+    vector_name: Option<String>,
+    filters: Option<CrateGraphSearchFilters>,
+}
+
+/// Optional filters accepted by `search_crate_graph`.
+#[derive(Debug, Deserialize)]
+struct CrateGraphSearchFilters {
+    workspace_id: Option<String>,
+    crate_name: Option<String>,
+    crate_root: Option<String>,
+}
+
 /// `get_file_context` request body.
 #[derive(Debug, Deserialize)]
 struct FileContextRequest {
@@ -1199,6 +1572,26 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
         .model(&config.embedding_model)
         .build()
         .context("failed to build diagnostic embedding client")?;
+    let semantic_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build semantic artifact embedding client")?;
+    let syntax_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build syntax artifact embedding client")?;
+    let inlay_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build inlay artifact embedding client")?;
+    let crate_graph_provider = EmbeddingBuilder::<Ollama>::new()
+        .base_url(&config.ollama_base_url)
+        .model(&config.embedding_model)
+        .build()
+        .context("failed to build crate-graph embedding client")?;
 
     let store = if let Some(api_key) = &config.qdrant_api_key {
         QdrantVectorStore::with_api_key(
@@ -1311,6 +1704,66 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
         )
     }
     .context("failed to initialize diagnostic Qdrant store")?;
+    let semantic_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            semantic_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_semantic_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            semantic_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_semantic_collection.clone(),
+        )
+    }
+    .context("failed to initialize semantic artifact Qdrant store")?;
+    let syntax_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            syntax_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_syntax_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            syntax_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_syntax_collection.clone(),
+        )
+    }
+    .context("failed to initialize syntax artifact Qdrant store")?;
+    let inlay_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            inlay_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_inlay_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            inlay_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_inlay_collection.clone(),
+        )
+    }
+    .context("failed to initialize inlay artifact Qdrant store")?;
+    let crate_graph_store = if let Some(api_key) = &config.qdrant_api_key {
+        QdrantVectorStore::with_api_key(
+            crate_graph_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_crate_graph_collection.clone(),
+            Some(api_key.clone()),
+        )
+    } else {
+        QdrantVectorStore::new(
+            crate_graph_provider,
+            config.qdrant_url.clone(),
+            config.qdrant_crate_graph_collection.clone(),
+        )
+    }
+    .context("failed to initialize crate-graph Qdrant store")?;
 
     Ok(Services {
         store,
@@ -1320,6 +1773,10 @@ async fn build_services(config: &RuntimeConfig) -> Result<Services> {
         call_edge_store,
         type_edge_store,
         diagnostic_store,
+        semantic_store,
+        syntax_store,
+        inlay_store,
+        crate_graph_store,
     })
 }
 
@@ -1344,8 +1801,9 @@ async fn indexer_loop(
                     break;
                 };
 
-                let mut batch: HashMap<PathBuf, DirtyEvent> = HashMap::new();
-                insert_batch_event(&mut batch, first);
+                let mut file_batch: HashMap<PathBuf, DirtyEvent> = HashMap::new();
+                let mut workspace_refresh_queued = false;
+                insert_batch_event(&mut file_batch, &mut workspace_refresh_queued, first);
 
                 let timer = tokio::time::sleep(debounce);
                 tokio::pin!(timer);
@@ -1362,26 +1820,39 @@ async fn indexer_loop(
                         }
                         maybe_event = rx.recv() => {
                             match maybe_event {
-                                Some(event) => insert_batch_event(&mut batch, event),
+                                Some(event) => insert_batch_event(
+                                    &mut file_batch,
+                                    &mut workspace_refresh_queued,
+                                    event,
+                                ),
                                 None => break,
                             }
                         }
                     }
                 }
 
-                process_batch(app.clone(), batch.into_values().collect()).await;
+                let mut events = file_batch.into_values().collect::<Vec<_>>();
+                if workspace_refresh_queued {
+                    events.push(DirtyEvent::RefreshWorkspace);
+                }
+                process_batch(app.clone(), events).await;
             }
         }
     }
 }
 
 /// Inserts/overwrites an event in the current batch keyed by file path.
-fn insert_batch_event(batch: &mut HashMap<PathBuf, DirtyEvent>, event: DirtyEvent) {
+fn insert_batch_event(
+    file_batch: &mut HashMap<PathBuf, DirtyEvent>,
+    workspace_refresh_queued: &mut bool,
+    event: DirtyEvent,
+) {
     // Last-write-wins per path inside a batch.
     match &event {
         DirtyEvent::Index(path) | DirtyEvent::Delete(path) => {
-            batch.insert(path.clone(), event);
+            file_batch.insert(path.clone(), event);
         }
+        DirtyEvent::RefreshWorkspace => *workspace_refresh_queued = true,
     }
 }
 
@@ -1401,6 +1872,7 @@ async fn process_batch(app: App, events: Vec<DirtyEvent>) {
         let result = match event {
             DirtyEvent::Index(path) => reindex_file(&app, &services, &path, batch_bulk_mode).await,
             DirtyEvent::Delete(path) => delete_file_chunks(&app, &path).await,
+            DirtyEvent::RefreshWorkspace => refresh_workspace_graph_with_retry(&app).await,
         };
 
         if let Err(err) = result {
@@ -1412,6 +1884,23 @@ async fn process_batch(app: App, events: Vec<DirtyEvent>) {
     let mut state = app.state.write().await;
     state.indexing_in_progress = false;
     state.indexed_at_unix_ms = Some(unix_ms_now());
+    let should_enqueue_deferred_graph_refresh = state.queue_depth == 0
+        && state.pending_initial_graph_refresh
+        && !state.initial_graph_refresh_done;
+    if should_enqueue_deferred_graph_refresh {
+        state.pending_initial_graph_refresh = false;
+        state.initial_graph_refresh_done = true;
+        state.queue_depth = state.queue_depth.saturating_add(1);
+    }
+    drop(state);
+
+    if should_enqueue_deferred_graph_refresh {
+        if app.dirty_tx.send(DirtyEvent::RefreshWorkspace).await.is_err() {
+            let mut state = app.state.write().await;
+            state.queue_depth = state.queue_depth.saturating_sub(1);
+            state.last_error = Some("index queue unavailable for deferred workspace refresh".to_string());
+        }
+    }
 }
 
 /// Reads and re-indexes one Rust file into Qdrant and local cache.
@@ -1444,6 +1933,9 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         previous_call_edge_ids,
         previous_type_edge_ids,
         previous_diagnostic_ids,
+        previous_semantic_ids,
+        previous_syntax_ids,
+        previous_inlay_ids,
     ) = {
         let state = app.state.read().await;
         (
@@ -1474,6 +1966,21 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 .unwrap_or_default(),
             state
                 .indexed_diagnostic_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_semantic_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_syntax_ids_by_file
+                .get(&file_rel)
+                .cloned()
+                .unwrap_or_default(),
+            state
+                .indexed_inlay_ids_by_file
                 .get(&file_rel)
                 .cloned()
                 .unwrap_or_default(),
@@ -1530,6 +2037,30 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 .await
                 .with_context(|| format!("qdrant diagnostic delete failed for {}", file_rel))?;
         }
+        if !previous_semantic_ids.is_empty() {
+            let stale_semantic_ids = previous_semantic_ids.into_iter().collect::<Vec<_>>();
+            services
+                .semantic_store
+                .delete_documents_by_ids(&stale_semantic_ids)
+                .await
+                .with_context(|| format!("qdrant semantic delete failed for {}", file_rel))?;
+        }
+        if !previous_syntax_ids.is_empty() {
+            let stale_syntax_ids = previous_syntax_ids.into_iter().collect::<Vec<_>>();
+            services
+                .syntax_store
+                .delete_documents_by_ids(&stale_syntax_ids)
+                .await
+                .with_context(|| format!("qdrant syntax delete failed for {}", file_rel))?;
+        }
+        if !previous_inlay_ids.is_empty() {
+            let stale_inlay_ids = previous_inlay_ids.into_iter().collect::<Vec<_>>();
+            services
+                .inlay_store
+                .delete_documents_by_ids(&stale_inlay_ids)
+                .await
+                .with_context(|| format!("qdrant inlay delete failed for {}", file_rel))?;
+        }
         let mut state = app.state.write().await;
         state.rust_items_by_file.remove(&file_rel);
         state.relations_by_file.remove(&file_rel);
@@ -1538,19 +2069,25 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         state.call_edges_by_file.remove(&file_rel);
         state.type_edges_by_file.remove(&file_rel);
         state.diagnostics_by_file.remove(&file_rel);
+        state.semantic_tokens_by_file.remove(&file_rel);
+        state.syntax_trees_by_file.remove(&file_rel);
+        state.inlay_hints_by_file.remove(&file_rel);
         state.indexed_ids_by_file.remove(&file_rel);
         state.indexed_relation_ids_by_file.remove(&file_rel);
         state.indexed_file_doc_ids_by_file.remove(&file_rel);
         state.indexed_call_edge_ids_by_file.remove(&file_rel);
         state.indexed_type_edge_ids_by_file.remove(&file_rel);
         state.indexed_diagnostic_ids_by_file.remove(&file_rel);
+        state.indexed_semantic_ids_by_file.remove(&file_rel);
+        state.indexed_syntax_ids_by_file.remove(&file_rel);
+        state.indexed_inlay_ids_by_file.remove(&file_rel);
         return Ok(());
     }
 
     // Symbol-aware enrichment stage. When symbols are available, they replace
     // coarse chunk fallback docs for the same file.
     let mut file_metrics = FileExtractionMetrics::default();
-    let (symbol_docs, mut relation_docs) = {
+    let (symbol_docs, mut relation_docs, semantic_token_docs, syntax_tree_docs, inlay_hint_docs) = {
         let mut ra = app.ra_manager.lock().await;
         let counters_before = ra.session_counters();
         match ra
@@ -1583,6 +2120,22 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                     Ok(v) => v,
                     Err(_) => Vec::new(),
                 };
+                    let (semantic_docs, syntax_docs, inlay_docs) = match ra
+                        .extract_file_artifacts(
+                            &cfg.workspace_root,
+                            &workspace_id,
+                            &file_rel,
+                            &file_uri,
+                            &content,
+                            &docs,
+                            cfg.enable_syntax_artifacts,
+                            &mut file_metrics,
+                        )
+                        .await
+                {
+                    Ok(v) => v,
+                    Err(_) => (Vec::new(), Vec::new(), Vec::new()),
+                };
                 let counters_after = ra.session_counters();
                 file_metrics.content_modified_retries = counters_after
                     .content_modified_retries_total
@@ -1590,7 +2143,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
-                (docs, relations)
+                (docs, relations, semantic_docs, syntax_docs, inlay_docs)
             }
             Ok(_) => {
                 file_metrics.fallback_heuristic = true;
@@ -1601,15 +2154,11 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
-                eprintln!(
-                    "[fallback-debug] file={} reason=empty_symbol_docs bulk_mode={} content_modified_retries={} request_timeouts={}",
-                    file_rel,
-                    bulk_mode,
-                    file_metrics.content_modified_retries,
-                    file_metrics.request_timeouts
-                );
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                 )
             }
@@ -1622,16 +2171,12 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
-                eprintln!(
-                    "[fallback-debug] file={} reason=extract_symbol_docs_error bulk_mode={} content_modified_retries={} request_timeouts={} error={:#}",
-                    file_rel,
-                    bulk_mode,
-                    file_metrics.content_modified_retries,
-                    file_metrics.request_timeouts,
-                    err
-                );
+                let _ = err;
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                 )
             }
@@ -1648,6 +2193,12 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         apply_crate_metadata_to_symbol_docs(&mut final_docs, crate_meta);
         apply_crate_metadata_to_relation_docs(&mut relation_docs, crate_meta);
     }
+    apply_artifact_summaries_to_symbols(
+        &mut final_docs,
+        &semantic_token_docs,
+        &syntax_tree_docs,
+        &inlay_hint_docs,
+    );
 
     let should_discard_for_warmup = {
         let state = app.state.read().await;
@@ -1666,10 +2217,6 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         };
 
         if requeue_needed {
-            eprintln!(
-                "[fallback-debug] file={} reason=warmup_discard_requeue",
-                file_rel
-            );
             app.dirty_tx
                 .send(DirtyEvent::Index(path.to_path_buf()))
                 .await
@@ -1679,11 +2226,9 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         return Ok(());
     }
 
-    let impl_calls_in_file =
-        file_metrics.implementations_success + file_metrics.implementations_failed;
     let should_discard_implementations_for_warmup = {
         let state = app.state.read().await;
-        !state.is_ra_warm_impl && impl_calls_in_file > 0
+        !state.is_ra_warm_impl && file_metrics.implementations_failed > 0
     };
     if should_discard_implementations_for_warmup {
         relation_docs.retain(|doc| doc.relation_kind != "implementations");
@@ -1707,14 +2252,12 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         };
 
         if requeue_needed {
-            eprintln!(
-                "[fallback-debug] file={} reason=impl_warmup_discard_requeue",
-                file_rel
-            );
             app.dirty_tx
                 .send(DirtyEvent::Index(path.to_path_buf()))
                 .await
-                .map_err(|_| anyhow::anyhow!("index queue unavailable during impl warm-up requeue"))?;
+                .map_err(|_| {
+                    anyhow::anyhow!("index queue unavailable during impl warm-up requeue")
+                })?;
         }
     }
 
@@ -1737,7 +2280,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .map(|doc| NamedVectorDocument {
             id: doc.id.clone(),
             raw: doc.clone(),
-            vectors: rust_item_named_vectors(doc),
+            vectors: debug_oversize_named_vectors(&doc.id, rust_item_named_vectors(doc)),
         })
         .collect::<Vec<_>>();
 
@@ -1753,7 +2296,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
                 raw: doc.clone(),
-                vectors: relation_named_vectors(doc),
+                vectors: debug_oversize_named_vectors(&doc.id, relation_named_vectors(doc)),
             })
             .collect::<Vec<_>>();
         services
@@ -1766,7 +2309,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
     let file_rows = vec![NamedVectorDocument {
         id: file_doc.id.clone(),
         raw: file_doc.clone(),
-        vectors: file_doc_named_vectors(&file_doc),
+        vectors: debug_oversize_named_vectors(&file_doc.id, file_doc_named_vectors(&file_doc)),
     }];
     services
         .file_store
@@ -1780,7 +2323,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
                 raw: doc.clone(),
-                vectors: call_edge_named_vectors(doc),
+                vectors: debug_oversize_named_vectors(&doc.id, call_edge_named_vectors(doc)),
             })
             .collect::<Vec<_>>();
         services
@@ -1796,7 +2339,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
                 raw: doc.clone(),
-                vectors: type_edge_named_vectors(doc),
+                vectors: debug_oversize_named_vectors(&doc.id, type_edge_named_vectors(doc)),
             })
             .collect::<Vec<_>>();
         services
@@ -1812,7 +2355,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
                 raw: doc.clone(),
-                vectors: diagnostic_named_vectors(doc),
+                vectors: debug_oversize_named_vectors(&doc.id, diagnostic_named_vectors(doc)),
             })
             .collect::<Vec<_>>();
         services
@@ -1820,6 +2363,57 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .insert_documents_with_named_vectors(diagnostic_rows)
             .await
             .with_context(|| format!("qdrant diagnostic upsert failed for {}", file_rel))?;
+    }
+    if !semantic_token_docs.is_empty() {
+        let semantic_rows = semantic_token_docs
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: debug_oversize_named_vectors(
+                    &doc.id,
+                    semantic_artifact_named_vectors(doc),
+                ),
+            })
+            .collect::<Vec<_>>();
+        services
+            .semantic_store
+            .insert_documents_with_named_vectors(semantic_rows)
+            .await
+            .with_context(|| format!("qdrant semantic upsert failed for {}", file_rel))?;
+    }
+    if !syntax_tree_docs.is_empty() {
+        let syntax_rows = syntax_tree_docs
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: debug_oversize_named_vectors(
+                    &doc.id,
+                    syntax_artifact_named_vectors(doc),
+                ),
+            })
+            .collect::<Vec<_>>();
+        services
+            .syntax_store
+            .insert_documents_with_named_vectors(syntax_rows)
+            .await
+            .with_context(|| format!("qdrant syntax upsert failed for {}", file_rel))?;
+    }
+    if !inlay_hint_docs.is_empty() {
+        let inlay_rows = inlay_hint_docs
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: debug_oversize_named_vectors(&doc.id, inlay_artifact_named_vectors(doc)),
+            })
+            .collect::<Vec<_>>();
+        services
+            .inlay_store
+            .insert_documents_with_named_vectors(inlay_rows)
+            .await
+            .with_context(|| format!("qdrant inlay upsert failed for {}", file_rel))?;
     }
 
     let final_chunks = symbol_docs_to_chunks(&final_docs);
@@ -1853,6 +2447,18 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .map(|doc| doc.id.clone())
         .collect::<HashSet<_>>();
     let final_diagnostic_ids = diagnostics
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    let final_semantic_ids = semantic_token_docs
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    let final_syntax_ids = syntax_tree_docs
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    let final_inlay_ids = inlay_hint_docs
         .iter()
         .map(|doc| doc.id.clone())
         .collect::<HashSet<_>>();
@@ -1911,6 +2517,39 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .await
             .with_context(|| format!("qdrant diagnostic stale delete failed for {}", file_rel))?;
     }
+    let stale_semantic_ids = previous_semantic_ids
+        .difference(&final_semantic_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_semantic_ids.is_empty() {
+        services
+            .semantic_store
+            .delete_documents_by_ids(&stale_semantic_ids)
+            .await
+            .with_context(|| format!("qdrant semantic stale delete failed for {}", file_rel))?;
+    }
+    let stale_syntax_ids = previous_syntax_ids
+        .difference(&final_syntax_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_syntax_ids.is_empty() {
+        services
+            .syntax_store
+            .delete_documents_by_ids(&stale_syntax_ids)
+            .await
+            .with_context(|| format!("qdrant syntax stale delete failed for {}", file_rel))?;
+    }
+    let stale_inlay_ids = previous_inlay_ids
+        .difference(&final_inlay_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_inlay_ids.is_empty() {
+        services
+            .inlay_store
+            .delete_documents_by_ids(&stale_inlay_ids)
+            .await
+            .with_context(|| format!("qdrant inlay stale delete failed for {}", file_rel))?;
+    }
 
     file_metrics.symbols_indexed = final_docs.len();
     file_metrics.relations_indexed = relation_docs.len();
@@ -1922,9 +2561,24 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .relations_by_file
         .insert(file_rel.clone(), relation_docs.clone());
     state.file_docs_by_file.insert(file_rel.clone(), file_doc);
-    state.call_edges_by_file.insert(file_rel.clone(), call_edges);
-    state.type_edges_by_file.insert(file_rel.clone(), type_edges);
-    state.diagnostics_by_file.insert(file_rel.clone(), diagnostics);
+    state
+        .call_edges_by_file
+        .insert(file_rel.clone(), call_edges);
+    state
+        .type_edges_by_file
+        .insert(file_rel.clone(), type_edges);
+    state
+        .diagnostics_by_file
+        .insert(file_rel.clone(), diagnostics);
+    state
+        .semantic_tokens_by_file
+        .insert(file_rel.clone(), semantic_token_docs);
+    state
+        .syntax_trees_by_file
+        .insert(file_rel.clone(), syntax_tree_docs);
+    state
+        .inlay_hints_by_file
+        .insert(file_rel.clone(), inlay_hint_docs);
     state.chunks_by_file.insert(file_rel.clone(), final_chunks);
     state
         .indexed_ids_by_file
@@ -1943,7 +2597,16 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         .insert(file_rel.clone(), final_type_edge_ids);
     state
         .indexed_diagnostic_ids_by_file
-        .insert(file_rel, final_diagnostic_ids);
+        .insert(file_rel.clone(), final_diagnostic_ids);
+    state
+        .indexed_semantic_ids_by_file
+        .insert(file_rel.clone(), final_semantic_ids);
+    state
+        .indexed_syntax_ids_by_file
+        .insert(file_rel.clone(), final_syntax_ids);
+    state
+        .indexed_inlay_ids_by_file
+        .insert(file_rel, final_inlay_ids);
     let metrics = &mut state.extraction_metrics;
     metrics.files_reindexed_total += 1;
     if file_metrics.fallback_heuristic {
@@ -1979,6 +2642,16 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
         file_metrics.relations_type_definitions_emitted;
     metrics.content_modified_retries_total += file_metrics.content_modified_retries;
     metrics.request_timeouts_total += file_metrics.request_timeouts;
+    metrics.semantic_tokens_success_total += file_metrics.semantic_tokens_success;
+    metrics.semantic_tokens_failed_total += file_metrics.semantic_tokens_failed;
+    metrics.semantic_tokens_nonempty_total += file_metrics.semantic_tokens_nonempty;
+    metrics.syntax_tree_success_total += file_metrics.syntax_tree_success;
+    metrics.syntax_tree_failed_total += file_metrics.syntax_tree_failed;
+    metrics.syntax_tree_nonempty_total += file_metrics.syntax_tree_nonempty;
+    metrics.syntax_tree_unsupported_total += file_metrics.syntax_tree_unsupported;
+    metrics.inlay_hints_success_total += file_metrics.inlay_hints_success;
+    metrics.inlay_hints_failed_total += file_metrics.inlay_hints_failed;
+    metrics.inlay_hints_nonempty_total += file_metrics.inlay_hints_nonempty;
 
     Ok(())
 }
@@ -2007,6 +2680,9 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
         call_edge_ids_to_delete,
         type_edge_ids_to_delete,
         diagnostic_ids_to_delete,
+        semantic_ids_to_delete,
+        syntax_ids_to_delete,
+        inlay_ids_to_delete,
     ) = {
         let mut state = app.state.write().await;
         state.rust_items_by_file.remove(&file_rel);
@@ -2016,6 +2692,9 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
         state.call_edges_by_file.remove(&file_rel);
         state.type_edges_by_file.remove(&file_rel);
         state.diagnostics_by_file.remove(&file_rel);
+        state.semantic_tokens_by_file.remove(&file_rel);
+        state.syntax_trees_by_file.remove(&file_rel);
+        state.inlay_hints_by_file.remove(&file_rel);
         let relation_ids_to_delete = state
             .indexed_relation_ids_by_file
             .remove(&file_rel)
@@ -2052,6 +2731,24 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
+        let semantic_ids_to_delete = state
+            .indexed_semantic_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let syntax_ids_to_delete = state
+            .indexed_syntax_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let inlay_ids_to_delete = state
+            .indexed_inlay_ids_by_file
+            .remove(&file_rel)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
         (
             relation_ids_to_delete,
             symbol_ids_to_delete,
@@ -2059,6 +2756,9 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
             call_edge_ids_to_delete,
             type_edge_ids_to_delete,
             diagnostic_ids_to_delete,
+            semantic_ids_to_delete,
+            syntax_ids_to_delete,
+            inlay_ids_to_delete,
         )
     };
     if !symbol_ids_to_delete.is_empty() {
@@ -2108,6 +2808,30 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
             .delete_documents_by_ids(&diagnostic_ids_to_delete)
             .await
             .with_context(|| format!("qdrant diagnostic delete failed for {}", file_rel))?;
+    }
+    if !semantic_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .semantic_store
+            .delete_documents_by_ids(&semantic_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant semantic delete failed for {}", file_rel))?;
+    }
+    if !syntax_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .syntax_store
+            .delete_documents_by_ids(&syntax_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant syntax delete failed for {}", file_rel))?;
+    }
+    if !inlay_ids_to_delete.is_empty() {
+        let services = app.services.read().await.clone();
+        services
+            .inlay_store
+            .delete_documents_by_ids(&inlay_ids_to_delete)
+            .await
+            .with_context(|| format!("qdrant inlay delete failed for {}", file_rel))?;
     }
 
     Ok(())
@@ -2224,6 +2948,32 @@ fn simple_hash(s: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn debug_oversize_named_vectors(doc_id: &str, vectors: HashMap<String, String>) -> HashMap<String, String> {
+    let mut sanitized = HashMap::with_capacity(vectors.len());
+    for (vector_name, text) in vectors {
+        let chars = text.chars().count();
+        if chars > EMBED_OVERSIZE_DEBUG_CHARS {
+            eprintln!(
+                "[embed-oversize-debug] doc_id={} vector={} chars={} threshold={}",
+                doc_id, vector_name, chars, EMBED_OVERSIZE_DEBUG_CHARS
+            );
+        }
+        if chars > EMBED_HARD_CAP_CHARS {
+            eprintln!(
+                "[embed-truncate-debug] doc_id={} vector={} chars={} cap={}",
+                doc_id, vector_name, chars, EMBED_HARD_CAP_CHARS
+            );
+            sanitized.insert(
+                vector_name,
+                text.chars().take(EMBED_HARD_CAP_CHARS).collect::<String>(),
+            );
+        } else {
+            sanitized.insert(vector_name, text);
+        }
+    }
+    sanitized
 }
 
 /// Recursively scans workspace files with include/exclude matching.
@@ -2375,9 +3125,28 @@ fn rust_item_named_vectors(doc: &schema::SymbolDoc) -> HashMap<String, String> {
                 workspace_id = doc.workspace_id,
             ),
         ),
+        (TYPE_VECTOR_NAME.to_string(), symbol_type_vector_text(doc)),
         (
-            TYPE_VECTOR_NAME.to_string(),
-            symbol_type_vector_text(doc),
+            SEMANTIC_VECTOR_NAME.to_string(),
+            format!(
+                "{semantic}\n{inlay}\nsymbol: {symbol}\npath: {path}\nworkspace_id: {workspace_id}",
+                semantic = doc.semantic_tokens_summary,
+                inlay = doc.inlay_hints_summary,
+                symbol = doc.symbol,
+                path = doc.file_path,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            SYNTAX_VECTOR_NAME.to_string(),
+            format!(
+                "{syntax}\nsymbol: {symbol}\nkind: {kind}\npath: {path}\nworkspace_id: {workspace_id}",
+                syntax = doc.syntax_tree_summary,
+                symbol = doc.symbol,
+                kind = doc.kind,
+                path = doc.file_path,
+                workspace_id = doc.workspace_id,
+            ),
         ),
     ])
 }
@@ -2445,10 +3214,7 @@ fn relation_named_vectors(doc: &schema::GraphEdgeDoc) -> HashMap<String, String>
                 workspace_id = doc.workspace_id,
             ),
         ),
-        (
-            GRAPH_VECTOR_NAME.to_string(),
-            relation_search_text(doc),
-        ),
+        (GRAPH_VECTOR_NAME.to_string(), relation_search_text(doc)),
         (
             TYPE_VECTOR_NAME.to_string(),
             format!(
@@ -2550,10 +3316,7 @@ fn file_doc_named_vectors(doc: &schema::FileDoc) -> HashMap<String, String> {
                 workspace_id = doc.workspace_id,
             ),
         ),
-        (
-            DOCS_VECTOR_NAME.to_string(),
-            file_doc_search_text(doc),
-        ),
+        (DOCS_VECTOR_NAME.to_string(), file_doc_search_text(doc)),
     ])
 }
 
@@ -2579,14 +3342,8 @@ fn call_edge_named_vectors(doc: &schema::CallEdge) -> HashMap<String, String> {
                 workspace_id = doc.workspace_id,
             ),
         ),
-        (
-            DOCS_VECTOR_NAME.to_string(),
-            call_edge_search_text(doc),
-        ),
-        (
-            GRAPH_VECTOR_NAME.to_string(),
-            call_edge_search_text(doc),
-        ),
+        (DOCS_VECTOR_NAME.to_string(), call_edge_search_text(doc)),
+        (GRAPH_VECTOR_NAME.to_string(), call_edge_search_text(doc)),
     ])
 }
 
@@ -2614,18 +3371,9 @@ fn type_edge_named_vectors(doc: &schema::TypeEdge) -> HashMap<String, String> {
                 workspace_id = doc.workspace_id,
             ),
         ),
-        (
-            DOCS_VECTOR_NAME.to_string(),
-            type_edge_search_text(doc),
-        ),
-        (
-            TYPE_VECTOR_NAME.to_string(),
-            type_edge_search_text(doc),
-        ),
-        (
-            GRAPH_VECTOR_NAME.to_string(),
-            type_edge_search_text(doc),
-        ),
+        (DOCS_VECTOR_NAME.to_string(), type_edge_search_text(doc)),
+        (TYPE_VECTOR_NAME.to_string(), type_edge_search_text(doc)),
+        (GRAPH_VECTOR_NAME.to_string(), type_edge_search_text(doc)),
     ])
 }
 
@@ -2651,10 +3399,120 @@ fn diagnostic_named_vectors(doc: &schema::DiagnosticDoc) -> HashMap<String, Stri
                 workspace_id = doc.workspace_id,
             ),
         ),
+        (DOCS_VECTOR_NAME.to_string(), diagnostic_search_text(doc)),
+    ])
+}
+
+fn semantic_artifact_search_text(doc: &schema::SemanticTokenDoc) -> String {
+    format!(
+        "semantic_tokens\nfile: {file_path}\nsymbol_id: {symbol_id}\ncount: {count}\nhist: {hist}\nsummary:\n{summary}\nworkspace_id: {workspace_id}",
+        file_path = doc.file_path,
+        symbol_id = doc.symbol_id.clone().unwrap_or_default(),
+        count = doc.token_count,
+        hist = doc.token_type_histogram.join(","),
+        summary = doc.summary,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn semantic_artifact_named_vectors(doc: &schema::SemanticTokenDoc) -> HashMap<String, String> {
+    HashMap::from([
         (
-            DOCS_VECTOR_NAME.to_string(),
-            diagnostic_search_text(doc),
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{file_path}\n{symbol_id}\nworkspace_id: {workspace_id}",
+                file_path = doc.file_path,
+                symbol_id = doc.symbol_id.clone().unwrap_or_default(),
+                workspace_id = doc.workspace_id,
+            ),
         ),
+        (
+            SEMANTIC_VECTOR_NAME.to_string(),
+            semantic_artifact_search_text(doc),
+        ),
+    ])
+}
+
+fn syntax_artifact_search_text(doc: &schema::SyntaxTreeDoc) -> String {
+    format!(
+        "syntax_tree\nfile: {file_path}\nsymbol_id: {symbol_id}\nhist: {hist}\nsummary:\n{summary}\nworkspace_id: {workspace_id}",
+        file_path = doc.file_path,
+        symbol_id = doc.symbol_id.clone().unwrap_or_default(),
+        hist = doc.node_kind_histogram.join(","),
+        summary = doc.summary,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn syntax_artifact_named_vectors(doc: &schema::SyntaxTreeDoc) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{file_path}\n{symbol_id}\nworkspace_id: {workspace_id}",
+                file_path = doc.file_path,
+                symbol_id = doc.symbol_id.clone().unwrap_or_default(),
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            SYNTAX_VECTOR_NAME.to_string(),
+            syntax_artifact_search_text(doc),
+        ),
+    ])
+}
+
+fn inlay_artifact_search_text(doc: &schema::InlayHintDoc) -> String {
+    format!(
+        "inlay_hints\nfile: {file_path}\nsymbol_id: {symbol_id}\ncount: {count}\nsummary:\n{summary}\nworkspace_id: {workspace_id}",
+        file_path = doc.file_path,
+        symbol_id = doc.symbol_id.clone().unwrap_or_default(),
+        count = doc.hint_count,
+        summary = doc.summary,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn inlay_artifact_named_vectors(doc: &schema::InlayHintDoc) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{file_path}\n{symbol_id}\nworkspace_id: {workspace_id}",
+                file_path = doc.file_path,
+                symbol_id = doc.symbol_id.clone().unwrap_or_default(),
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (
+            SEMANTIC_VECTOR_NAME.to_string(),
+            inlay_artifact_search_text(doc),
+        ),
+    ])
+}
+
+fn crate_graph_search_text(doc: &schema::CrateGraphDoc) -> String {
+    format!(
+        "crate_graph\ncrate: {crate_name}\nroot: {crate_root}\nsummary:\n{summary}\nworkspace_id: {workspace_id}",
+        crate_name = doc.crate_name,
+        crate_root = doc.crate_root,
+        summary = doc.summary,
+        workspace_id = doc.workspace_id,
+    )
+}
+
+fn crate_graph_named_vectors(doc: &schema::CrateGraphDoc) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYMBOL_VECTOR_NAME.to_string(),
+            format!(
+                "{crate_name}\n{crate_root}\nworkspace_id: {workspace_id}",
+                crate_name = doc.crate_name,
+                crate_root = doc.crate_root,
+                workspace_id = doc.workspace_id,
+            ),
+        ),
+        (GRAPH_VECTOR_NAME.to_string(), crate_graph_search_text(doc)),
     ])
 }
 
@@ -2822,7 +3680,7 @@ fn build_crate_metadata_docs(
         .collect()
 }
 
-async fn refresh_workspace_metadata(app: &App) -> Result<()> {
+async fn refresh_workspace_metadata_static(app: &App) -> Result<()> {
     let cfg = app.config.read().await.clone();
     let metadata = load_workspace_metadata(&cfg.workspace_root)?;
     let docs = build_crate_metadata_docs(&cfg.workspace_id, &metadata);
@@ -2849,7 +3707,7 @@ async fn refresh_workspace_metadata(app: &App) -> Result<()> {
             .map(|doc| NamedVectorDocument {
                 id: doc.id.clone(),
                 raw: doc.clone(),
-                vectors: crate_metadata_named_vectors(doc),
+                vectors: debug_oversize_named_vectors(&doc.id, crate_metadata_named_vectors(doc)),
             })
             .collect::<Vec<_>>();
         app.services
@@ -2871,6 +3729,147 @@ async fn refresh_workspace_metadata(app: &App) -> Result<()> {
     state.metadata_docs_by_crate = by_crate;
     state.indexed_metadata_ids = new_ids;
     Ok(())
+}
+
+async fn refresh_workspace_graph(app: &App) -> Result<()> {
+    let cfg = app.config.read().await.clone();
+    let by_crate = app.state.read().await.metadata_docs_by_crate.clone();
+    let mut crate_graph_docs = Vec::<schema::CrateGraphDoc>::new();
+    {
+        let mut ra = app.ra_manager.lock().await;
+        for crate_doc in by_crate.values() {
+            match ra
+                .extract_crate_graph_doc(
+                    &cfg.workspace_root,
+                    &cfg.workspace_id,
+                    &crate_doc.crate_name,
+                    &crate_doc.crate_root,
+                )
+                .await
+            {
+                Ok(Some(doc)) => crate_graph_docs.push(doc),
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    let new_graph_ids = crate_graph_docs
+        .iter()
+        .map(|d| d.id.clone())
+        .collect::<HashSet<_>>();
+    let previous_graph_ids = app.state.read().await.indexed_crate_graph_ids.clone();
+    let stale_graph_ids = previous_graph_ids
+        .difference(&new_graph_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_graph_ids.is_empty() {
+        app.services
+            .read()
+            .await
+            .crate_graph_store
+            .delete_documents_by_ids(&stale_graph_ids)
+            .await
+            .context("qdrant crate-graph stale delete failed")?;
+    }
+    if !crate_graph_docs.is_empty() {
+        let rows = crate_graph_docs
+            .iter()
+            .map(|doc| NamedVectorDocument {
+                id: doc.id.clone(),
+                raw: doc.clone(),
+                vectors: debug_oversize_named_vectors(&doc.id, crate_graph_named_vectors(doc)),
+            })
+            .collect::<Vec<_>>();
+        app.services
+            .read()
+            .await
+            .crate_graph_store
+            .insert_documents_with_named_vectors(rows)
+            .await
+            .context("qdrant crate-graph upsert failed")?;
+    }
+    let mut crate_graph_by_crate = HashMap::new();
+    for doc in crate_graph_docs {
+        crate_graph_by_crate.insert(doc.crate_root.clone(), doc);
+    }
+
+    let mut state = app.state.write().await;
+    state.crate_graph_by_crate = crate_graph_by_crate;
+    state.indexed_crate_graph_ids = new_graph_ids.clone();
+    state.extraction_metrics.crate_graph_success_total += new_graph_ids.len() as u64;
+    if !new_graph_ids.is_empty() {
+        state.extraction_metrics.crate_graph_nonempty_total += 1;
+    }
+    Ok(())
+}
+
+async fn refresh_workspace_graph_with_retry(app: &App) -> Result<()> {
+    let requires_crate_graph_warmup = !app.state.read().await.is_ra_warm_crate_graph;
+    if requires_crate_graph_warmup {
+        {
+            let mut state = app.state.write().await;
+            state.is_ra_warm_crate_graph = true;
+            state.workspace_refresh_retry_count = 0;
+            state.extraction_metrics.workspace_refresh_requeued_total += 1;
+            state.queue_depth = state.queue_depth.saturating_add(1);
+        }
+        app.dirty_tx
+            .send(DirtyEvent::RefreshWorkspace)
+            .await
+            .map_err(|_| anyhow::anyhow!("index queue unavailable during crate-graph warmup"))?;
+        return Ok(());
+    }
+
+    match refresh_workspace_graph(app).await {
+        Ok(()) => {
+            let mut state = app.state.write().await;
+            state.is_ra_warm_crate_graph = true;
+            state.workspace_refresh_retry_count = 0;
+            Ok(())
+        }
+        Err(err) if is_method_unsupported_error(&err) => {
+            let mut state = app.state.write().await;
+            state.is_ra_warm_crate_graph = true;
+            state.workspace_refresh_retry_count = 0;
+            state.extraction_metrics.crate_graph_unsupported_total += 1;
+            Ok(())
+        }
+        Err(err) if is_transient_lsp_error(&err) => {
+            let mut should_requeue = false;
+            {
+                let mut state = app.state.write().await;
+                state.is_ra_warm_crate_graph = true;
+                if state.workspace_refresh_retry_count < WORKSPACE_REFRESH_MAX_RETRIES {
+                    state.workspace_refresh_retry_count += 1;
+                    state.extraction_metrics.workspace_refresh_requeued_total += 1;
+                    state
+                        .extraction_metrics
+                        .crate_graph_transient_requeued_total += 1;
+                    state.queue_depth = state.queue_depth.saturating_add(1);
+                    should_requeue = true;
+                } else {
+                    state.workspace_refresh_retry_count = 0;
+                    state.extraction_metrics.crate_graph_failed_total += 1;
+                }
+            }
+            if should_requeue {
+                app.dirty_tx
+                    .send(DirtyEvent::RefreshWorkspace)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("index queue unavailable during workspace transient retry")
+                    })?;
+                return Ok(());
+            }
+            Err(err)
+        }
+        Err(err) => {
+            let mut state = app.state.write().await;
+            state.workspace_refresh_retry_count = 0;
+            state.extraction_metrics.crate_graph_failed_total += 1;
+            Err(err)
+        }
+    }
 }
 
 fn load_workspace_metadata(root: &Path) -> Result<WorkspaceMetadata> {
@@ -3022,6 +4021,7 @@ async fn extract_symbol_relations_with_lsp(
         if let Ok(Some(references)) = references {
             references_payload = Some(references.clone());
             metrics.references_success += 1;
+            let reference_locations = lsp_locations_from_value(&references).len();
             let emitted = append_relation_targets(
                 &mut out,
                 &mut seen,
@@ -3038,6 +4038,7 @@ async fn extract_symbol_relations_with_lsp(
             if emitted > 0 {
                 metrics.references_nonempty += 1;
             }
+            let _ = reference_locations;
             metrics.relations_references_emitted += emitted as u64;
         } else if references.is_err() {
             metrics.references_failed += 1;
@@ -3094,10 +4095,7 @@ async fn extract_symbol_relations_with_lsp(
                 metrics.relations_implementations_emitted += emitted as u64;
             } else if let Err(err) = implementations {
                 metrics.implementations_failed += 1;
-                eprintln!(
-                    "[implementations-debug] file={} symbol={} kind={} start_line={} reason=request_error error={:#}",
-                    doc.file_path, doc.symbol, doc.kind, doc.start_line, err
-                );
+                let _ = err;
             }
         }
         let definitions = session
@@ -3134,10 +4132,6 @@ async fn extract_symbol_relations_with_lsp(
             metrics.definitions_failed += 1;
         }
         if should_request_type_definitions_for_symbol(doc) {
-            eprintln!(
-                "[type-def-debug] file={} symbol={} kind={} query_pos={}:{}",
-                doc.file_path, doc.symbol, doc.kind, doc.start_line, doc.start_character
-            );
             let type_definitions = session
                 .request_if_supported(
                     "textDocument/typeDefinition",
@@ -3150,13 +4144,6 @@ async fn extract_symbol_relations_with_lsp(
                 )
                 .await;
             if let Ok(Some(type_definitions)) = type_definitions {
-                let primary_location_count = lsp_locations_from_value(&type_definitions).len();
-                if should_debug_missing_type_definition_symbol(doc) {
-                    eprintln!(
-                        "[type-def-focus] file={} symbol={} kind={} stage=primary locations={}",
-                        doc.file_path, doc.symbol, doc.kind, primary_location_count
-                    );
-                }
                 metrics.type_definitions_success += 1;
                 let mut emitted = append_relation_targets(
                     &mut out,
@@ -3172,18 +4159,13 @@ async fn extract_symbol_relations_with_lsp(
                 )
                 .await?;
                 if emitted == 0
-                    && let Some((usage_line, usage_character)) =
-                        symbol_usage_position_in_file(
-                            &source_lines,
-                            &doc.symbol,
-                            doc.start_line,
-                            doc.end_line,
-                        )
+                    && let Some((usage_line, usage_character)) = symbol_usage_position_in_file(
+                        &source_lines,
+                        &doc.symbol,
+                        doc.start_line,
+                        doc.end_line,
+                    )
                 {
-                    eprintln!(
-                        "[type-def-debug] file={} symbol={} kind={} fallback=usage_pos query_pos={}:{}",
-                        doc.file_path, doc.symbol, doc.kind, usage_line, usage_character
-                    );
                     let usage_type_definitions = session
                         .request_if_supported(
                             "textDocument/typeDefinition",
@@ -3199,18 +4181,6 @@ async fn extract_symbol_relations_with_lsp(
                         )
                         .await;
                     if let Ok(Some(payload)) = usage_type_definitions {
-                        let usage_location_count = lsp_locations_from_value(&payload).len();
-                        if should_debug_missing_type_definition_symbol(doc) {
-                            eprintln!(
-                                "[type-def-focus] file={} symbol={} kind={} stage=usage_fallback locations={} query_pos={}:{}",
-                                doc.file_path,
-                                doc.symbol,
-                                doc.kind,
-                                usage_location_count,
-                                usage_line,
-                                usage_character
-                            );
-                        }
                         emitted += append_relation_targets(
                             &mut out,
                             &mut seen,
@@ -3224,34 +4194,14 @@ async fn extract_symbol_relations_with_lsp(
                             &source_lines,
                         )
                         .await?;
-                    } else if let Err(err) = usage_type_definitions {
-                        eprintln!(
-                            "[type-def-debug] file={} symbol={} kind={} fallback=usage_pos result=error error={:#}",
-                            doc.file_path, doc.symbol, doc.kind, err
-                        );
                     }
                 }
-                eprintln!(
-                    "[type-def-debug] file={} symbol={} kind={} result=ok emitted={}",
-                    doc.file_path, doc.symbol, doc.kind, emitted
-                );
                 if emitted > 0 {
                     metrics.type_definitions_nonempty += 1;
                 }
                 metrics.relations_type_definitions_emitted += emitted as u64;
             } else if type_definitions.is_err() {
                 metrics.type_definitions_failed += 1;
-                if let Err(err) = type_definitions {
-                    eprintln!(
-                        "[type-def-debug] file={} symbol={} kind={} result=error error={:#}",
-                        doc.file_path, doc.symbol, doc.kind, err
-                    );
-                }
-            } else {
-                eprintln!(
-                    "[type-def-debug] file={} symbol={} kind={} result=unsupported_or_none",
-                    doc.file_path, doc.symbol, doc.kind
-                );
             }
         }
     }
@@ -3369,6 +4319,7 @@ async fn append_relation_targets_with_filter(
         });
         emitted += 1;
     }
+
     Ok(emitted)
 }
 
@@ -3532,12 +4483,8 @@ async fn enrich_docs_with_lsp_metadata(
             metrics.hover_success += 1;
             doc.hover_summary = lsp_hover_to_text(&hover).unwrap_or_default();
             if doc.hover_summary.trim().is_empty()
-                && let Some((retry_line, retry_character)) = symbol_position_in_lsp_range(
-                    &lines,
-                    &doc.symbol,
-                    doc.start_line,
-                    doc.end_line,
-                )
+                && let Some((retry_line, retry_character)) =
+                    symbol_position_in_lsp_range(&lines, &doc.symbol, doc.start_line, doc.end_line)
                 && (retry_line.saturating_sub(1) != primary_line
                     || retry_character != primary_character)
             {
@@ -3621,6 +4568,472 @@ async fn enrich_docs_with_lsp_metadata(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct DecodedSemanticToken {
+    line: usize,
+    start_character: usize,
+    length: usize,
+    token_type_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DecodedInlayHint {
+    line: usize,
+    character: usize,
+    label: String,
+}
+
+async fn extract_lsp_artifact_docs(
+    session: &mut RaLspSession,
+    workspace_id: &str,
+    file_path_rel: &str,
+    file_uri: &str,
+    content: &str,
+    docs: &[schema::SymbolDoc],
+    enable_syntax_artifacts: bool,
+    metrics: &mut FileExtractionMetrics,
+) -> Result<(
+    Vec<schema::SemanticTokenDoc>,
+    Vec<schema::SyntaxTreeDoc>,
+    Vec<schema::InlayHintDoc>,
+)> {
+    let mut semantic_docs = Vec::<schema::SemanticTokenDoc>::new();
+    let mut syntax_docs = Vec::<schema::SyntaxTreeDoc>::new();
+    let mut inlay_docs = Vec::<schema::InlayHintDoc>::new();
+    let line_count = content.lines().count().max(1);
+
+    let semantic_payload = session
+        .request_if_supported(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": file_uri } }),
+            LSP_HEAVY_REQUEST_TIMEOUT,
+            LSP_CONTENT_MODIFIED_RETRIES,
+        )
+        .await;
+    match semantic_payload {
+        Ok(Some(payload)) => {
+            metrics.semantic_tokens_success += 1;
+            let tokens = decode_semantic_tokens(&payload);
+            if !tokens.is_empty() {
+                metrics.semantic_tokens_nonempty += 1;
+            }
+            semantic_docs.push(build_file_semantic_doc(
+                workspace_id,
+                file_path_rel,
+                file_uri,
+                &tokens,
+                line_count,
+            ));
+            for doc in docs {
+                semantic_docs.push(build_symbol_semantic_doc(
+                    workspace_id,
+                    file_path_rel,
+                    file_uri,
+                    doc,
+                    &tokens,
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(_) => metrics.semantic_tokens_failed += 1,
+    }
+
+    if enable_syntax_artifacts {
+        let syntax_payload = session
+            .request_if_supported(
+                "rust-analyzer/viewSyntaxTree",
+                json!({ "textDocument": { "uri": file_uri } }),
+                LSP_HEAVY_REQUEST_TIMEOUT,
+                LSP_CONTENT_MODIFIED_RETRIES,
+            )
+            .await;
+        match syntax_payload {
+            Ok(Some(payload)) => {
+                metrics.syntax_tree_success += 1;
+                let normalized = payload
+                    .as_str()
+                    .map(normalize_syntax_tree_text)
+                    .unwrap_or_else(|| normalize_syntax_tree_text(&payload.to_string()));
+                if !normalized.trim().is_empty() {
+                    metrics.syntax_tree_nonempty += 1;
+                }
+                let node_kind_histogram = syntax_histogram(&normalized);
+                syntax_docs.push(schema::SyntaxTreeDoc {
+                    id: format!("syntax:{workspace_id}:{file_path_rel}:file"),
+                    workspace_id: workspace_id.to_string(),
+                    file_path: file_path_rel.to_string(),
+                    uri: file_uri.to_string(),
+                    symbol_id: None,
+                    node_kind_histogram: node_kind_histogram.clone(),
+                    summary: compact_syntax_summary(&node_kind_histogram, None),
+                    span: schema::Span {
+                        file_path: file_path_rel.to_string(),
+                        uri: file_uri.to_string(),
+                        start_line: 1,
+                        start_character: 0,
+                        end_line: line_count,
+                        end_character: None,
+                    },
+                });
+                for doc in docs {
+                    syntax_docs.push(schema::SyntaxTreeDoc {
+                        id: format!(
+                            "syntax:{workspace_id}:{file_path_rel}:{}",
+                            doc.symbol_id_stable
+                        ),
+                        workspace_id: workspace_id.to_string(),
+                        file_path: file_path_rel.to_string(),
+                        uri: file_uri.to_string(),
+                        symbol_id: Some(doc.symbol_id_stable.clone()),
+                        node_kind_histogram: node_kind_histogram.clone(),
+                        summary: syntax_summary_for_symbol(&node_kind_histogram, doc),
+                        span: doc.span.clone(),
+                    });
+                }
+            }
+            Ok(None) => {
+                metrics.syntax_tree_unsupported += 1;
+                eprintln!(
+                    "[syntax-tree-debug] file={} result=unsupported_or_none",
+                    file_path_rel
+                );
+            }
+            Err(_) => metrics.syntax_tree_failed += 1,
+        }
+    }
+
+    let inlay_payload = session
+        .request_if_supported(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": file_uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": line_count, "character": 0 }
+                }
+            }),
+            LSP_HEAVY_REQUEST_TIMEOUT,
+            LSP_CONTENT_MODIFIED_RETRIES,
+        )
+        .await;
+    match inlay_payload {
+        Ok(Some(payload)) => {
+            metrics.inlay_hints_success += 1;
+            let hints = decode_inlay_hints(&payload);
+            if !hints.is_empty() {
+                metrics.inlay_hints_nonempty += 1;
+            }
+            inlay_docs.push(schema::InlayHintDoc {
+                id: format!("inlay:{workspace_id}:{file_path_rel}:file"),
+                workspace_id: workspace_id.to_string(),
+                file_path: file_path_rel.to_string(),
+                uri: file_uri.to_string(),
+                symbol_id: None,
+                hint_count: hints.len(),
+                summary: summarize_inlay_hints(&hints),
+                span: schema::Span {
+                    file_path: file_path_rel.to_string(),
+                    uri: file_uri.to_string(),
+                    start_line: 1,
+                    start_character: 0,
+                    end_line: line_count,
+                    end_character: None,
+                },
+            });
+            for doc in docs {
+                let symbol_hints = hints
+                    .iter()
+                    .filter(|h| h.line >= doc.start_line && h.line <= doc.end_line)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                inlay_docs.push(schema::InlayHintDoc {
+                    id: format!(
+                        "inlay:{workspace_id}:{file_path_rel}:{}",
+                        doc.symbol_id_stable
+                    ),
+                    workspace_id: workspace_id.to_string(),
+                    file_path: file_path_rel.to_string(),
+                    uri: file_uri.to_string(),
+                    symbol_id: Some(doc.symbol_id_stable.clone()),
+                    hint_count: symbol_hints.len(),
+                    summary: summarize_inlay_hints(&symbol_hints),
+                    span: doc.span.clone(),
+                });
+            }
+        }
+        Ok(None) => {}
+        Err(_) => metrics.inlay_hints_failed += 1,
+    }
+
+    Ok((semantic_docs, syntax_docs, inlay_docs))
+}
+
+fn decode_semantic_tokens(payload: &Value) -> Vec<DecodedSemanticToken> {
+    let raw = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut line = 0usize;
+    let mut start = 0usize;
+    for chunk in raw.chunks_exact(5) {
+        let delta_line = chunk[0].as_u64().unwrap_or(0) as usize;
+        let delta_start = chunk[1].as_u64().unwrap_or(0) as usize;
+        let length = chunk[2].as_u64().unwrap_or(0) as usize;
+        let token_type_idx = chunk[3].as_u64().unwrap_or(0) as usize;
+        if delta_line == 0 {
+            start = start.saturating_add(delta_start);
+        } else {
+            line = line.saturating_add(delta_line);
+            start = delta_start;
+        }
+        out.push(DecodedSemanticToken {
+            line: line.saturating_add(1),
+            start_character: start,
+            length,
+            token_type_idx,
+        });
+    }
+    out
+}
+
+fn build_file_semantic_doc(
+    workspace_id: &str,
+    file_path_rel: &str,
+    file_uri: &str,
+    tokens: &[DecodedSemanticToken],
+    line_count: usize,
+) -> schema::SemanticTokenDoc {
+    schema::SemanticTokenDoc {
+        id: format!("semantic:{workspace_id}:{file_path_rel}:file"),
+        workspace_id: workspace_id.to_string(),
+        file_path: file_path_rel.to_string(),
+        uri: file_uri.to_string(),
+        symbol_id: None,
+        token_count: tokens.len(),
+        token_type_histogram: semantic_histogram(tokens),
+        summary: summarize_semantic_tokens(tokens),
+        span: schema::Span {
+            file_path: file_path_rel.to_string(),
+            uri: file_uri.to_string(),
+            start_line: 1,
+            start_character: 0,
+            end_line: line_count,
+            end_character: None,
+        },
+    }
+}
+
+fn build_symbol_semantic_doc(
+    workspace_id: &str,
+    file_path_rel: &str,
+    file_uri: &str,
+    symbol: &schema::SymbolDoc,
+    tokens: &[DecodedSemanticToken],
+) -> schema::SemanticTokenDoc {
+    let symbol_tokens = tokens
+        .iter()
+        .filter(|t| t.line >= symbol.start_line && t.line <= symbol.end_line)
+        .cloned()
+        .collect::<Vec<_>>();
+    schema::SemanticTokenDoc {
+        id: format!(
+            "semantic:{workspace_id}:{file_path_rel}:{}",
+            symbol.symbol_id_stable
+        ),
+        workspace_id: workspace_id.to_string(),
+        file_path: file_path_rel.to_string(),
+        uri: file_uri.to_string(),
+        symbol_id: Some(symbol.symbol_id_stable.clone()),
+        token_count: symbol_tokens.len(),
+        token_type_histogram: semantic_histogram(&symbol_tokens),
+        summary: summarize_semantic_tokens(&symbol_tokens),
+        span: symbol.span.clone(),
+    }
+}
+
+fn semantic_histogram(tokens: &[DecodedSemanticToken]) -> Vec<String> {
+    let mut by_type = HashMap::<usize, usize>::new();
+    for token in tokens {
+        *by_type.entry(token.token_type_idx).or_default() += 1;
+    }
+    let mut rows = by_type.into_iter().map(|(k, v)| (k, v)).collect::<Vec<_>>();
+    rows.sort_by_key(|(k, _)| *k);
+    rows.into_iter()
+        .map(|(k, v)| format!("type_{k}:{v}"))
+        .collect()
+}
+
+fn summarize_semantic_tokens(tokens: &[DecodedSemanticToken]) -> String {
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let avg_len = tokens.iter().map(|t| t.length as u64).sum::<u64>() as f64 / tokens.len() as f64;
+    let first_line = tokens.first().map(|t| t.line).unwrap_or(0);
+    let last_line = tokens.last().map(|t| t.line).unwrap_or(first_line);
+    let min_char = tokens.iter().map(|t| t.start_character).min().unwrap_or(0);
+    format!(
+        "semantic_tokens count={} avg_len={:.2} lines={}..{} min_char={}",
+        tokens.len(),
+        avg_len,
+        first_line,
+        last_line,
+        min_char
+    )
+}
+
+fn normalize_syntax_tree_text(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(400)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn syntax_histogram(summary: &str) -> Vec<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for line in summary.lines() {
+        let key = line
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !key.is_empty() {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    let mut rows = counts.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.into_iter().map(|(k, v)| format!("{k}:{v}")).collect()
+}
+
+fn compact_syntax_summary(histogram: &[String], span: Option<(usize, usize)>) -> String {
+    let top = histogram
+        .iter()
+        .take(24)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Some((start, end)) = span {
+        return format!(
+            "syntax_kinds_count: {}\nspan: {}..{}\ntop_kinds: {}",
+            histogram.len(),
+            start,
+            end,
+            top
+        );
+    }
+    format!(
+        "syntax_kinds_count: {}\ntop_kinds: {}",
+        histogram.len(),
+        top
+    )
+}
+
+fn syntax_summary_for_symbol(histogram: &[String], symbol: &schema::SymbolDoc) -> String {
+    format!(
+        "symbol: {}\nkind: {}\n{}",
+        symbol.symbol,
+        symbol.kind,
+        compact_syntax_summary(histogram, Some((symbol.start_line, symbol.end_line)))
+    )
+}
+
+fn decode_inlay_hints(payload: &Value) -> Vec<DecodedInlayHint> {
+    let mut out = Vec::new();
+    let Some(items) = payload.as_array() else {
+        return out;
+    };
+    for item in items {
+        let line = item
+            .get("position")
+            .and_then(|v| v.get("line"))
+            .and_then(Value::as_u64)
+            .map(|v| v as usize + 1)
+            .unwrap_or(0);
+        let character = item
+            .get("position")
+            .and_then(|v| v.get("character"))
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let label = match item.get("label") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("value").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        out.push(DecodedInlayHint {
+            line,
+            character,
+            label,
+        });
+    }
+    out
+}
+
+fn summarize_inlay_hints(hints: &[DecodedInlayHint]) -> String {
+    if hints.is_empty() {
+        return String::new();
+    }
+    hints
+        .iter()
+        .take(80)
+        .map(|h| format!("{}:{} {}", h.line, h.character, h.label))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_artifact_summaries_to_symbols(
+    symbols: &mut [schema::SymbolDoc],
+    semantic_docs: &[schema::SemanticTokenDoc],
+    syntax_docs: &[schema::SyntaxTreeDoc],
+    inlay_docs: &[schema::InlayHintDoc],
+) {
+    let semantic_by_symbol = semantic_docs
+        .iter()
+        .filter_map(|doc| {
+            doc.symbol_id
+                .as_ref()
+                .map(|id| (id.as_str(), doc.summary.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    let syntax_by_symbol = syntax_docs
+        .iter()
+        .filter_map(|doc| {
+            doc.symbol_id
+                .as_ref()
+                .map(|id| (id.as_str(), doc.summary.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    let inlay_by_symbol = inlay_docs
+        .iter()
+        .filter_map(|doc| {
+            doc.symbol_id
+                .as_ref()
+                .map(|id| (id.as_str(), doc.summary.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for symbol in symbols {
+        if let Some(summary) = semantic_by_symbol.get(symbol.symbol_id_stable.as_str()) {
+            symbol.semantic_tokens_summary = (*summary).to_string();
+        }
+        if let Some(summary) = syntax_by_symbol.get(symbol.symbol_id_stable.as_str()) {
+            symbol.syntax_tree_summary = (*summary).to_string();
+        }
+        if let Some(summary) = inlay_by_symbol.get(symbol.symbol_id_stable.as_str()) {
+            symbol.inlay_hints_summary = (*summary).to_string();
+        }
+    }
+}
+
 fn should_extract_relations_for_symbol(doc: &schema::SymbolDoc, bulk_mode: bool) -> bool {
     match doc.kind.as_str() {
         // Skip noisy/low-value leaf symbols for relation extraction.
@@ -3641,10 +5054,6 @@ fn should_fallback_implementations_from_references(doc: &schema::SymbolDoc) -> b
 
 fn should_request_type_definitions_for_symbol(doc: &schema::SymbolDoc) -> bool {
     matches!(doc.kind.as_str(), "trait" | "struct" | "enum")
-}
-
-fn should_debug_missing_type_definition_symbol(doc: &schema::SymbolDoc) -> bool {
-    matches!(doc.symbol.as_str(), "Rule" | "ValueState")
 }
 
 fn lsp_hover_to_text(result: &Value) -> Option<String> {
@@ -4305,7 +5714,9 @@ fn collect_signature(lines: &[&str], start_idx: usize, end_idx: usize) -> String
         return String::new();
     }
 
-    let stop_idx = end_idx.min(lines.len().saturating_sub(1)).min(start_idx + 8);
+    let stop_idx = end_idx
+        .min(lines.len().saturating_sub(1))
+        .min(start_idx + 8);
     let mut parts = Vec::<String>::new();
 
     for idx in start_idx..=stop_idx {
@@ -4582,13 +5993,7 @@ mod tests {
             "search_code",
             r#"fn search_code() { let query = "rust"; }"#,
         );
-        let c2 = sample_item(
-            "src/main.rs",
-            "c2",
-            "mod",
-            "parser",
-            "mod parser;",
-        );
+        let c2 = sample_item("src/main.rs", "c2", "mod", "parser", "mod parser;");
         map.insert("src/main.rs".to_string(), vec![c1, c2]);
 
         let ranked = mcp_layer::lexical_search(map, "search rust", 5);
@@ -4701,7 +6106,10 @@ where
     fn normalize_crate_root_maps_workspace_root_to_dot() {
         assert_eq!(normalize_crate_root(Path::new("")), ".");
         assert_eq!(normalize_crate_root(Path::new(".")), ".");
-        assert_eq!(normalize_crate_root(Path::new("crates/core")), "crates/core");
+        assert_eq!(
+            normalize_crate_root(Path::new("crates/core")),
+            "crates/core"
+        );
     }
 
     #[test]
@@ -4857,6 +6265,12 @@ where
     }
 
     #[test]
+    fn timeout_error_is_treated_as_transient() {
+        let err = anyhow::anyhow!("rust-analyzer request timed out: rust-analyzer/viewCrateGraph");
+        assert!(is_transient_lsp_error(&err));
+    }
+
+    #[test]
     fn explain_relevance_request_accepts_query_only_payload() {
         let req: ExplainRelevanceRequest = serde_json::from_value(json!({
             "query": "find trait impls",
@@ -4895,8 +6309,12 @@ where
 
     #[test]
     fn relation_target_is_low_signal_for_import_and_module_lines() {
-        assert!(relation_target_is_low_signal("use crate::types::ValueState;"));
-        assert!(relation_target_is_low_signal("pub use crate::engine::run_default;"));
+        assert!(relation_target_is_low_signal(
+            "use crate::types::ValueState;"
+        ));
+        assert!(relation_target_is_low_signal(
+            "pub use crate::engine::run_default;"
+        ));
         assert!(relation_target_is_low_signal("mod engine;"));
         assert!(relation_target_is_low_signal("pub mod engine;"));
         assert!(relation_target_is_low_signal("extern crate alloc;"));
@@ -4923,5 +6341,40 @@ where
             "let rule = PositiveRule;",
             "PositiveRule"
         ));
+    }
+
+    #[test]
+    fn summarize_crate_graph_payload_compacts_dot_for_target_crate() {
+        let payload = json!(
+            "digraph rust_analyzer_crate_graph {\n\
+             _1[label=\\\"fixture\\\"][shape=\\\"box\\\"];\n\
+             _2[label=\\\"helper\\\"][shape=\\\"box\\\"];\n\
+             _3[label=\\\"serde\\\"][shape=\\\"box\\\"];\n\
+             _1 -> _2[label=\\\"\\\"];\n\
+             _1 -> _3[label=\\\"\\\"];\n\
+             _2 -> _1[label=\\\"\\\"];\n\
+             }\n"
+        );
+        let summary = summarize_crate_graph_payload(&payload, "fixture");
+        assert!(summary.contains("crate: fixture"));
+        assert!(summary.contains("node_found: true"));
+        assert!(summary.contains("outbound_deps_count:"));
+        assert!(summary.contains("inbound_deps_count:"));
+        assert!(summary.contains("outbound_deps:"));
+        assert!(summary.contains("inbound_deps:"));
+        assert!(!summary.contains("digraph rust_analyzer_crate_graph"));
+    }
+
+    #[test]
+    fn summarize_crate_graph_payload_handles_missing_crate_node() {
+        let payload = json!(
+            "digraph rust_analyzer_crate_graph {\n\
+             _1[label=\\\"other\\\"][shape=\\\"box\\\"];\n\
+             }\n"
+        );
+        let summary = summarize_crate_graph_payload(&payload, "fixture");
+        assert!(summary.contains("crate: fixture"));
+        assert!(summary.contains("node_found: false"));
+        assert!(!summary.contains("digraph rust_analyzer_crate_graph"));
     }
 }

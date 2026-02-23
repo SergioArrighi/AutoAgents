@@ -143,6 +143,18 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         if let Some(diagnostic_collection) = params.diagnostic_collection {
             cfg.qdrant_diagnostic_collection = diagnostic_collection;
         }
+        if let Some(semantic_collection) = params.semantic_collection {
+            cfg.qdrant_semantic_collection = semantic_collection;
+        }
+        if let Some(syntax_collection) = params.syntax_collection {
+            cfg.qdrant_syntax_collection = syntax_collection;
+        }
+        if let Some(inlay_collection) = params.inlay_collection {
+            cfg.qdrant_inlay_collection = inlay_collection;
+        }
+        if let Some(crate_graph_collection) = params.crate_graph_collection {
+            cfg.qdrant_crate_graph_collection = crate_graph_collection;
+        }
         if let Some(config) = params.config {
             if let Some(v) = config.ollama_base_url {
                 cfg.ollama_base_url = v;
@@ -162,6 +174,9 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
                 }
                 cfg.workspace_id = v;
             }
+            if let Some(v) = config.enable_syntax_artifacts {
+                cfg.enable_syntax_artifacts = v;
+            }
         }
 
         let rebuilt = build_services(&cfg).await.map_err(|err| RpcError {
@@ -175,6 +190,10 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         let mut state = app.state.write().await;
         state.is_ra_warm = false;
         state.is_ra_warm_impl = false;
+        state.is_ra_warm_crate_graph = false;
+        state.workspace_refresh_retry_count = 0;
+        state.pending_initial_graph_refresh = false;
+        state.initial_graph_refresh_done = false;
     }
 
     if workspace_changed {
@@ -186,18 +205,30 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         state.call_edges_by_file.clear();
         state.type_edges_by_file.clear();
         state.diagnostics_by_file.clear();
+        state.semantic_tokens_by_file.clear();
+        state.syntax_trees_by_file.clear();
+        state.inlay_hints_by_file.clear();
+        state.crate_graph_by_crate.clear();
         state.indexed_ids_by_file.clear();
         state.indexed_relation_ids_by_file.clear();
         state.indexed_file_doc_ids_by_file.clear();
         state.indexed_call_edge_ids_by_file.clear();
         state.indexed_type_edge_ids_by_file.clear();
         state.indexed_diagnostic_ids_by_file.clear();
+        state.indexed_semantic_ids_by_file.clear();
+        state.indexed_syntax_ids_by_file.clear();
+        state.indexed_inlay_ids_by_file.clear();
         state.workspace_metadata = None;
         state.metadata_docs_by_crate.clear();
         state.indexed_metadata_ids.clear();
+        state.indexed_crate_graph_ids.clear();
         state.extraction_metrics = ExtractionMetrics::default();
         state.is_ra_warm = false;
         state.is_ra_warm_impl = false;
+        state.is_ra_warm_crate_graph = false;
+        state.workspace_refresh_retry_count = 0;
+        state.pending_initial_graph_refresh = false;
+        state.initial_graph_refresh_done = false;
         state.queue_depth = 0;
         state.indexing_in_progress = false;
         state.last_error = None;
@@ -205,7 +236,7 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
         app.ra_manager.lock().await.reset().await;
     }
 
-    let _ = refresh_workspace_metadata(&app).await;
+    let _ = refresh_workspace_metadata_static(&app).await;
 
     Ok(json!({
         "protocol_version": PROTOCOL_VERSION,
@@ -238,6 +269,9 @@ async fn handle_scan_full(app: App, params: ScanFullParams) -> Result<Value, Rpc
     {
         let mut state = app.state.write().await;
         state.queue_depth = state.queue_depth.saturating_add(enqueued);
+        if enqueued > 0 && !state.initial_graph_refresh_done {
+            state.pending_initial_graph_refresh = true;
+        }
     }
 
     Ok(json!({"enqueued": enqueued}))
@@ -289,7 +323,23 @@ async fn handle_workspace_renamed(
         cfg.workspace_id = derive_workspace_id(&cfg.workspace_root);
         drop(cfg);
         app.ra_manager.lock().await.reset().await;
-        let _ = refresh_workspace_metadata(&app).await;
+        {
+            let mut state = app.state.write().await;
+            state.is_ra_warm_crate_graph = false;
+            state.workspace_refresh_retry_count = 0;
+            state.pending_initial_graph_refresh = false;
+            state.initial_graph_refresh_done = false;
+        }
+        let _ = refresh_workspace_metadata_static(&app).await;
+        if app
+            .dirty_tx
+            .send(DirtyEvent::RefreshWorkspace)
+            .await
+            .is_ok()
+        {
+            let mut state = app.state.write().await;
+            state.queue_depth = state.queue_depth.saturating_add(1);
+        }
         return Ok(json!({"ok": true}));
     }
 

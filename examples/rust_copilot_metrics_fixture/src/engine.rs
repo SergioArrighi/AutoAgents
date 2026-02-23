@@ -18,7 +18,7 @@ pub fn run_default(left: i32, right: i32) -> ValueState {
     let rule = PositiveRule;
     let allowed = Engine::run(&rule, left, right);
     if allowed {
-        classify(left + right)
+        classify(fixture_helper::add(left, right))
     } else {
         ValueState::Zero
     }

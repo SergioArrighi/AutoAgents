@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 fn load_json(path: &Path) -> Value {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed reading {}: {err}", path.display()));
-    serde_json::from_str(&raw).unwrap_or_else(|err| panic!("invalid json {}: {err}", path.display()))
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("invalid json {}: {err}", path.display()))
 }
 
 fn as_object<'a>(value: &'a Value, path: &str) -> &'a serde_json::Map<String, Value> {
@@ -81,18 +82,21 @@ fn eval_contract_offline_scoring() {
         "observed.index_status.status.extraction_metrics",
     );
     let expected_extraction = as_object(
-        gates.get("extraction_metrics_exact")
+        gates
+            .get("extraction_metrics_exact")
             .expect("contract: missing extraction_metrics_exact"),
         "contract.gates.extraction_metrics_exact",
     );
 
     let expected_index_status = as_object(
-        gates.get("index_status_exact")
+        gates
+            .get("index_status_exact")
             .expect("contract: missing index_status_exact"),
         "contract.gates.index_status_exact",
     );
     let expected_qdrant = as_object(
-        gates.get("qdrant_points_exact")
+        gates
+            .get("qdrant_points_exact")
             .expect("contract: missing qdrant_points_exact"),
         "contract.gates.qdrant_points_exact",
     );
@@ -104,7 +108,8 @@ fn eval_contract_offline_scoring() {
     );
 
     let expected_retrieval = as_object(
-        gates.get("retrieval_assertions")
+        gates
+            .get("retrieval_assertions")
             .expect("contract: missing retrieval_assertions"),
         "contract.gates.retrieval_assertions",
     );
@@ -175,9 +180,9 @@ fn eval_contract_offline_scoring() {
         );
         for (field, expected_value) in expected_rule {
             checks_total += 1;
-            let observed_field_name = field
-                .strip_prefix("expected_")
-                .unwrap_or_else(|| panic!("expected retrieval key must start with 'expected_': {field}"));
+            let observed_field_name = field.strip_prefix("expected_").unwrap_or_else(|| {
+                panic!("expected retrieval key must start with 'expected_': {field}")
+            });
             let observed_value = observed_rule.get(observed_field_name).unwrap_or_else(|| {
                 panic!(
                     "observed retrieval assertion missing field '{observed_field_name}' for '{query_id}'"

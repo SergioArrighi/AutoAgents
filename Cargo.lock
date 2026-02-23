@@ -3026,6 +3026,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
+name = "fixture_helper"
+version = "0.1.0"
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7370,6 +7374,9 @@ dependencies = [
 [[package]]
 name = "rust-copilot-metrics-fixture"
 version = "0.1.0"
+dependencies = [
+ "fixture_helper",
+]
 
 [[package]]
 name = "rust-mcp-schema"

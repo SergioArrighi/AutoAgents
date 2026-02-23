@@ -88,6 +88,9 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
                 "search_calls",
                 "search_types",
                 "search_diagnostics",
+                "search_semantic_artifacts",
+                "search_syntax_artifacts",
+                "search_crate_graph",
                 "workspace_metadata",
                 "get_file_chunks",
                 "get_file_context",
@@ -124,6 +127,24 @@ async fn route_mcp(app: App, method: &str, path: &str, body: &[u8]) -> String {
         ("POST", "/mcp/tools/search_diagnostics") => {
             match parse_json_body::<SearchDiagnosticsRequest>(body) {
                 Ok(req) => handle_mcp_search_diagnostics(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
+        ("POST", "/mcp/tools/search_semantic_artifacts") => {
+            match parse_json_body::<SearchSemanticArtifactsRequest>(body) {
+                Ok(req) => handle_mcp_search_semantic_artifacts(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
+        ("POST", "/mcp/tools/search_syntax_artifacts") => {
+            match parse_json_body::<SearchSyntaxArtifactsRequest>(body) {
+                Ok(req) => handle_mcp_search_syntax_artifacts(app, req).await,
+                Err(err) => Err(err),
+            }
+        }
+        ("POST", "/mcp/tools/search_crate_graph") => {
+            match parse_json_body::<SearchCrateGraphRequest>(body) {
+                Ok(req) => handle_mcp_search_crate_graph(app, req).await,
                 Err(err) => Err(err),
             }
         }
@@ -236,10 +257,12 @@ async fn handle_mcp_search_code(app: App, req: SearchCodeRequest) -> Result<Valu
             vector_name.as_deref(),
             semantic_samples,
             &[
-                (SYMBOL_VECTOR_NAME, 0.45),
-                (DOCS_VECTOR_NAME, 0.25),
-                (SIGNATURE_VECTOR_NAME, 0.15),
-                (TYPE_VECTOR_NAME, 0.15),
+                (SYMBOL_VECTOR_NAME, 0.38),
+                (DOCS_VECTOR_NAME, 0.22),
+                (SIGNATURE_VECTOR_NAME, 0.12),
+                (TYPE_VECTOR_NAME, 0.12),
+                (SEMANTIC_VECTOR_NAME, 0.08),
+                (SYNTAX_VECTOR_NAME, 0.08),
             ],
             |item: &schema::SymbolDoc| {
                 matches_filters(item, req.filters.as_ref(), &default_workspace_id)
@@ -506,7 +529,7 @@ async fn handle_mcp_search_diagnostics(
 
     let (semantic, used_semantic_vectors) = {
         let services = app.services.read().await.clone();
-        semantic_search_fused(
+        match semantic_search_fused(
             &services.diagnostic_store,
             &req.query,
             vector_name.as_deref(),
@@ -518,7 +541,25 @@ async fn handle_mcp_search_diagnostics(
             "diagnostic search request",
             "semantic diagnostic search failed",
         )
-        .await?
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) if is_missing_collection_rpc_error(&err.message) => {
+                let state = app.state.read().await;
+                return Ok(json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "indexing_in_progress": state.indexing_in_progress,
+                    "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+                    "semantic_vector_names": Vec::<String>::new(),
+                    "results": Vec::<Value>::new(),
+                    "availability": {
+                        "status": "unavailable",
+                        "reason": "diagnostic_collection_not_initialized"
+                    }
+                }));
+            }
+            Err(err) => return Err(err),
+        }
     };
 
     let rows = semantic
@@ -538,6 +579,171 @@ async fn handle_mcp_search_diagnostics(
             .map(|(score, item)| json!({
                 "score": score,
                 "item": canonical_diagnostic_doc(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Implements `search_semantic_artifacts` over semantic-token docs.
+async fn handle_mcp_search_semantic_artifacts(
+    app: App,
+    req: SearchSemanticArtifactsRequest,
+) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let (semantic, used_semantic_vectors) = {
+        let services = app.services.read().await.clone();
+        semantic_search_fused(
+            &services.semantic_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.30), (SEMANTIC_VECTOR_NAME, 0.70)],
+            |item: &schema::SemanticTokenDoc| {
+                matches_semantic_artifact_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "semantic artifact search request",
+            "semantic artifact search failed",
+        )
+        .await?
+    };
+
+    let rows = semantic.into_iter().take(top_k).collect::<Vec<_>>();
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_semantic_artifact_doc(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Implements `search_syntax_artifacts` over syntax-tree docs.
+async fn handle_mcp_search_syntax_artifacts(
+    app: App,
+    req: SearchSyntaxArtifactsRequest,
+) -> Result<Value, RpcError> {
+    if !app.config.read().await.enable_syntax_artifacts {
+        let state = app.state.read().await;
+        return Ok(json!({
+            "schema_version": SCHEMA_VERSION,
+            "indexing_in_progress": state.indexing_in_progress,
+            "semantic_vector_name": req.vector_name.unwrap_or_else(|| "fused".to_string()),
+            "semantic_vector_names": Vec::<String>::new(),
+            "results": Vec::<Value>::new(),
+            "availability": {
+                "status": "disabled",
+                "reason": "syntax_artifacts_feature_flag_off"
+            }
+        }));
+    }
+
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let (semantic, used_semantic_vectors) = {
+        let services = app.services.read().await.clone();
+        match semantic_search_fused(
+            &services.syntax_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.30), (SYNTAX_VECTOR_NAME, 0.70)],
+            |item: &schema::SyntaxTreeDoc| {
+                matches_syntax_artifact_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "syntax artifact search request",
+            "syntax artifact search failed",
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) if is_missing_collection_rpc_error(&err.message) => {
+                let state = app.state.read().await;
+                return Ok(json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "indexing_in_progress": state.indexing_in_progress,
+                    "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+                    "semantic_vector_names": Vec::<String>::new(),
+                    "results": Vec::<Value>::new(),
+                    "availability": {
+                        "status": "unavailable",
+                        "reason": "syntax_collection_not_initialized"
+                    }
+                }));
+            }
+            Err(err) => return Err(err),
+        }
+    };
+
+    let rows = semantic.into_iter().take(top_k).collect::<Vec<_>>();
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_syntax_artifact_doc(&item),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Implements `search_crate_graph` over crate-graph docs.
+async fn handle_mcp_search_crate_graph(
+    app: App,
+    req: SearchCrateGraphRequest,
+) -> Result<Value, RpcError> {
+    let top_k = resolve_limit(req.limit, req.top_k, 8);
+    let semantic_samples = (top_k.saturating_mul(3)).clamp(top_k, 64);
+    let vector_name = req.vector_name.clone();
+    let default_workspace_id = app.config.read().await.workspace_id.clone();
+
+    let (semantic, used_semantic_vectors) = {
+        let services = app.services.read().await.clone();
+        semantic_search_fused(
+            &services.crate_graph_store,
+            &req.query,
+            vector_name.as_deref(),
+            semantic_samples,
+            &[(SYMBOL_VECTOR_NAME, 0.35), (GRAPH_VECTOR_NAME, 0.65)],
+            |item: &schema::CrateGraphDoc| {
+                matches_crate_graph_filters(item, req.filters.as_ref(), &default_workspace_id)
+            },
+            "crate-graph search request",
+            "semantic crate-graph search failed",
+        )
+        .await?
+    };
+
+    let rows = semantic.into_iter().take(top_k).collect::<Vec<_>>();
+    let state = app.state.read().await;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "indexing_in_progress": state.indexing_in_progress,
+        "semantic_vector_name": vector_name.unwrap_or_else(|| "fused".to_string()),
+        "semantic_vector_names": used_semantic_vectors,
+        "results": rows
+            .into_iter()
+            .map(|(score, item)| json!({
+                "score": score,
+                "item": canonical_crate_graph_doc(&item),
             }))
             .collect::<Vec<_>>(),
     }))
@@ -654,10 +860,20 @@ where
                 message: format!("invalid {invalid_request_context}: {err}"),
             })?;
 
-        let rows = store.top_n::<T>(request).await.map_err(|err| RpcError {
-            code: 500,
-            message: format!("{search_failure_context}: {err}"),
-        })?;
+        let rows = match store.top_n::<T>(request).await {
+            Ok(rows) => rows,
+            Err(err) if is_missing_vector_error(&err) => {
+                // Channel not indexed yet in this collection: skip instead of failing
+                // the whole fused search request.
+                continue;
+            }
+            Err(err) => {
+                return Err(RpcError {
+                    code: 500,
+                    message: format!("{search_failure_context}: {err}"),
+                });
+            }
+        };
         used_vectors.push(vector_name);
 
         for (score, id, item) in rows {
@@ -672,6 +888,18 @@ where
     let mut rows = merged.into_values().collect::<Vec<_>>();
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok((rows, used_vectors))
+}
+
+fn is_missing_vector_error(err: &autoagents_core::vector_store::VectorStoreError) -> bool {
+    let msg = err.to_string().to_lowercase();
+    (msg.contains("vector") && msg.contains("not found"))
+        || msg.contains("vector name")
+        || msg.contains("no vector")
+}
+
+fn is_missing_collection_rpc_error(message: &str) -> bool {
+    let msg = message.to_lowercase();
+    msg.contains("collection") && (msg.contains("doesn't exist") || msg.contains("not found"))
 }
 
 fn resolve_limit(limit: Option<usize>, top_k: Option<usize>, default: usize) -> usize {
@@ -702,6 +930,18 @@ fn canonical_diagnostic_doc(item: &schema::DiagnosticDoc) -> schema::DiagnosticD
     item.clone()
 }
 
+fn canonical_semantic_artifact_doc(item: &schema::SemanticTokenDoc) -> schema::SemanticTokenDoc {
+    item.clone()
+}
+
+fn canonical_syntax_artifact_doc(item: &schema::SyntaxTreeDoc) -> schema::SyntaxTreeDoc {
+    item.clone()
+}
+
+fn canonical_crate_graph_doc(item: &schema::CrateGraphDoc) -> schema::CrateGraphDoc {
+    item.clone()
+}
+
 fn rerank_relation_results(
     query: &str,
     mut rows: Vec<(f64, schema::GraphEdgeDoc)>,
@@ -712,8 +952,7 @@ fn rerank_relation_results(
 
     rows.sort_by(|(left_score, left_item), (right_score, right_item)| {
         let left = relation_relevance_score(*left_score, left_item, intent_kind, &query_tokens);
-        let right =
-            relation_relevance_score(*right_score, right_item, intent_kind, &query_tokens);
+        let right = relation_relevance_score(*right_score, right_item, intent_kind, &query_tokens);
         right
             .partial_cmp(&left)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -788,7 +1027,10 @@ fn query_tokens(query: &str) -> HashSet<String> {
         .collect::<HashSet<_>>()
 }
 
-fn source_symbol_token_overlap(item: &schema::GraphEdgeDoc, query_tokens: &HashSet<String>) -> bool {
+fn source_symbol_token_overlap(
+    item: &schema::GraphEdgeDoc,
+    query_tokens: &HashSet<String>,
+) -> bool {
     if query_tokens.is_empty() {
         return false;
     }
@@ -1011,6 +1253,93 @@ fn matches_diagnostic_filters(
     }
     if let Some(code) = &filters.code
         && item.code.as_deref() != Some(code.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+fn matches_semantic_artifact_filters(
+    item: &schema::SemanticTokenDoc,
+    filters: Option<&SemanticArtifactSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(file_path) = &filters.file_path
+        && !item.file_path.contains(file_path)
+    {
+        return false;
+    }
+    if let Some(symbol_id) = &filters.symbol_id
+        && item.symbol_id.as_deref() != Some(symbol_id.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+fn matches_syntax_artifact_filters(
+    item: &schema::SyntaxTreeDoc,
+    filters: Option<&SyntaxArtifactSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(file_path) = &filters.file_path
+        && !item.file_path.contains(file_path)
+    {
+        return false;
+    }
+    if let Some(symbol_id) = &filters.symbol_id
+        && item.symbol_id.as_deref() != Some(symbol_id.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+fn matches_crate_graph_filters(
+    item: &schema::CrateGraphDoc,
+    filters: Option<&CrateGraphSearchFilters>,
+    default_workspace_id: &str,
+) -> bool {
+    let workspace_id = filters
+        .and_then(|filters| filters.workspace_id.as_deref())
+        .unwrap_or(default_workspace_id);
+    if item.workspace_id != workspace_id {
+        return false;
+    }
+
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(crate_name) = &filters.crate_name
+        && item.crate_name != *crate_name
+    {
+        return false;
+    }
+    if let Some(crate_root) = &filters.crate_root
+        && !item.crate_root.contains(crate_root)
     {
         return false;
     }
@@ -1528,7 +1857,12 @@ mod tests {
         assert!(kept.contains(&"positiverule".to_string()));
     }
 
-    fn sample_doc(id: &str, symbol: &str, signature: &str, body_excerpt: &str) -> schema::SymbolDoc {
+    fn sample_doc(
+        id: &str,
+        symbol: &str,
+        signature: &str,
+        body_excerpt: &str,
+    ) -> schema::SymbolDoc {
         schema::SymbolDoc {
             id: id.to_string(),
             kind: "fn".to_string(),
@@ -1559,6 +1893,9 @@ mod tests {
             stability: None,
             body_hash: String::new(),
             symbol_id_stable: id.to_string(),
+            semantic_tokens_summary: String::new(),
+            syntax_tree_summary: String::new(),
+            inlay_hints_summary: String::new(),
         }
     }
 
@@ -1612,7 +1949,18 @@ mod tests {
         let rows = vec![(0.70, definition), (0.66, implementation)];
         let reranked = rerank_relation_results("PositiveRule implements Rule", rows, 2);
 
-        assert_eq!(reranked.first().map(|(_, item)| item.relation_kind.as_str()), Some("implementations"));
+        assert_eq!(
+            reranked
+                .first()
+                .map(|(_, item)| item.relation_kind.as_str()),
+            Some("implementations")
+        );
+    }
+
+    #[test]
+    fn is_missing_collection_rpc_error_detects_qdrant_message() {
+        let msg = "syntax artifact search failed: Datastore error: Error in the response: Some requested entity was not found Not found: Collection `rust_copilot_syntax_artifacts` doesn't exist!";
+        assert!(is_missing_collection_rpc_error(msg));
     }
 }
 
@@ -1647,10 +1995,12 @@ async fn handle_mcp_explain_relevance(
                     vector_name.as_deref(),
                     semantic_samples,
                     &[
-                        (SYMBOL_VECTOR_NAME, 0.45),
-                        (DOCS_VECTOR_NAME, 0.25),
-                        (SIGNATURE_VECTOR_NAME, 0.15),
-                        (TYPE_VECTOR_NAME, 0.15),
+                        (SYMBOL_VECTOR_NAME, 0.38),
+                        (DOCS_VECTOR_NAME, 0.22),
+                        (SIGNATURE_VECTOR_NAME, 0.12),
+                        (TYPE_VECTOR_NAME, 0.12),
+                        (SEMANTIC_VECTOR_NAME, 0.08),
+                        (SYNTAX_VECTOR_NAME, 0.08),
                     ],
                     |item: &schema::SymbolDoc| {
                         matches_filters(item, req.filters.as_ref(), &default_workspace_id)
