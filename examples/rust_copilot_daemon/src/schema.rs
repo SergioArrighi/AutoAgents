@@ -235,6 +235,7 @@ pub(crate) struct TypeEdge {
 pub(crate) struct DiagnosticDoc {
     pub(crate) id: String,
     pub(crate) workspace_id: String,
+    pub(crate) source: String,
     pub(crate) file_path: String,
     pub(crate) uri: String,
     pub(crate) severity: String,

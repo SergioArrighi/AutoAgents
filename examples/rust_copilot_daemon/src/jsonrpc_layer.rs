@@ -183,6 +183,20 @@ async fn handle_initialize(app: App, params: InitializeParams) -> Result<Value, 
             code: -32001,
             message: format!("failed to rebuild services: {err}"),
         })?;
+
+        let diagnostic_dimensions = HashMap::from([
+            (SYMBOL_VECTOR_NAME.to_string(), 1024_u64),
+            (DOCS_VECTOR_NAME.to_string(), 1024_u64),
+        ]);
+        rebuilt
+            .diagnostic_store
+            .recreate_named_collection(diagnostic_dimensions)
+            .await
+            .map_err(|err| RpcError {
+                code: -32001,
+                message: format!("failed to recreate diagnostic collection: {err}"),
+            })?;
+
         *app.services.write().await = rebuilt;
     }
 

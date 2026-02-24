@@ -342,6 +342,9 @@ struct ExtractionMetrics {
     crate_graph_failed_total: u64,
     crate_graph_nonempty_total: u64,
     diagnostics_indexed_total: u64,
+    diagnostics_received_total: u64,
+    diagnostics_deleted_total: u64,
+    diagnostic_index_errors_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -386,6 +389,9 @@ struct FileExtractionMetrics {
     inlay_hints_failed: u64,
     inlay_hints_nonempty: u64,
     diagnostics_indexed: usize,
+    diagnostics_received: u64,
+    diagnostics_deleted: u64,
+    diagnostic_index_errors: u64,
 }
 
 /// Mutable daemon state shared by both planes.
@@ -573,13 +579,17 @@ impl RaSessionManager {
         self.workspace_root = None;
     }
 
-    async fn ensure_session(&mut self, workspace_root: &Path) -> Result<&mut RaLspSession> {
+    async fn ensure_session(
+        &mut self,
+        workspace_root: &Path,
+        workspace_id: &str,
+    ) -> Result<&mut RaLspSession> {
         if self.workspace_root.as_deref() != Some(workspace_root) {
             self.reset().await;
         }
 
         if self.session.is_none() {
-            self.session = Some(RaLspSession::start(workspace_root).await?);
+            self.session = Some(RaLspSession::start(workspace_root, workspace_id).await?);
             self.workspace_root = Some(workspace_root.to_path_buf());
         }
 
@@ -605,7 +615,7 @@ impl RaSessionManager {
             file_uri.to_string()
         };
 
-        let session = self.ensure_session(workspace_root).await?;
+        let session = self.ensure_session(workspace_root, workspace_id).await?;
         session.sync_document(&file_uri, content).await?;
         let Some(result) = session
             .request_if_supported(
@@ -655,7 +665,7 @@ impl RaSessionManager {
         bulk_mode: bool,
         metrics: &mut FileExtractionMetrics,
     ) -> Result<Vec<schema::GraphEdgeDoc>> {
-        let session = self.ensure_session(workspace_root).await?;
+        let session = self.ensure_session(workspace_root, workspace_id).await?;
         session.sync_document(file_uri, content).await?;
         let relations = extract_symbol_relations_with_lsp(
             session,
@@ -687,7 +697,7 @@ impl RaSessionManager {
         Vec<schema::SyntaxTreeDoc>,
         Vec<schema::InlayHintDoc>,
     )> {
-        let session = self.ensure_session(workspace_root).await?;
+        let session = self.ensure_session(workspace_root, workspace_id).await?;
         session.sync_document(file_uri, content).await?;
         extract_lsp_artifact_docs(
             session,
@@ -709,14 +719,12 @@ impl RaSessionManager {
         file_path_rel: &str,
         file_uri: &str,
     ) -> Result<Vec<schema::DiagnosticDoc>> {
-        let session = self.ensure_session(workspace_root).await?;
+        let session = self.ensure_session(workspace_root, workspace_id).await?;
         let diagnostics = session.latest_diagnostics_for_uri(file_uri).await?;
-        Ok(build_diagnostic_docs_from_lsp(
-            workspace_id,
-            file_path_rel,
-            file_uri,
-            &diagnostics,
-        ))
+        Ok(diagnostics
+            .into_iter()
+            .filter(|d| d.workspace_id == workspace_id && d.file_path == file_path_rel)
+            .collect::<Vec<_>>())
     }
 
     async fn extract_crate_graph_doc(
@@ -726,7 +734,7 @@ impl RaSessionManager {
         crate_name: &str,
         crate_root: &str,
     ) -> Result<Option<schema::CrateGraphDoc>> {
-        let session = self.ensure_session(workspace_root).await?;
+        let session = self.ensure_session(workspace_root, workspace_id).await?;
         let Some(payload) = session
             .request_if_supported(
                 "rust-analyzer/viewCrateGraph",
@@ -883,7 +891,10 @@ struct RaLspSession {
     unsupported_methods: HashSet<String>,
     content_modified_retries_total: u64,
     request_timeouts_total: u64,
-    diagnostics_by_uri: HashMap<String, Vec<Value>>,
+    diagnostics_by_uri: HashMap<String, Vec<schema::DiagnosticDoc>>,
+    workspace_root: PathBuf,
+    workspace_id: String,
+    diagnostics_received_total: u64,
     work_done_in_flight: usize,
     saw_work_done_progress: bool,
 }
@@ -892,10 +903,11 @@ struct RaLspSession {
 struct RaSessionCounters {
     content_modified_retries_total: u64,
     request_timeouts_total: u64,
+    diagnostics_received_total: u64,
 }
 
 impl RaLspSession {
-    async fn start(workspace_root: &Path) -> Result<Self> {
+    async fn start(workspace_root: &Path, workspace_id: &str) -> Result<Self> {
         let mut child = Command::new("rust-analyzer")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -921,6 +933,9 @@ impl RaLspSession {
             content_modified_retries_total: 0,
             request_timeouts_total: 0,
             diagnostics_by_uri: HashMap::new(),
+            workspace_root: workspace_root.to_path_buf(),
+            workspace_id: workspace_id.to_string(),
+            diagnostics_received_total: 0,
             work_done_in_flight: 0,
             saw_work_done_progress: false,
         };
@@ -1032,6 +1047,9 @@ impl RaLspSession {
                 &mut self.work_done_in_flight,
                 &mut self.saw_work_done_progress,
                 &mut self.diagnostics_by_uri,
+                &self.workspace_root,
+                &self.workspace_id,
+                &mut self.diagnostics_received_total,
             )
             .await?;
             Ok::<Value, anyhow::Error>(response.get("result").cloned().unwrap_or(Value::Null))
@@ -1154,6 +1172,9 @@ impl RaLspSession {
                             &mut self.work_done_in_flight,
                             &mut self.saw_work_done_progress,
                             &mut self.diagnostics_by_uri,
+                            &self.workspace_root,
+                            &self.workspace_id,
+                            &mut self.diagnostics_received_total,
                         );
                     }
                 }
@@ -1175,6 +1196,9 @@ impl RaLspSession {
                             &mut self.work_done_in_flight,
                             &mut self.saw_work_done_progress,
                             &mut self.diagnostics_by_uri,
+                            &self.workspace_root,
+                            &self.workspace_id,
+                            &mut self.diagnostics_received_total,
                         );
                     }
                 }
@@ -1185,7 +1209,10 @@ impl RaLspSession {
         }
     }
 
-    async fn latest_diagnostics_for_uri(&mut self, file_uri: &str) -> Result<Vec<Value>> {
+    async fn latest_diagnostics_for_uri(
+        &mut self,
+        file_uri: &str,
+    ) -> Result<Vec<schema::DiagnosticDoc>> {
         self.wait_for_work_done_settle(LSP_WORK_DONE_SETTLE_TIMEOUT)
             .await?;
         self.collect_pending_messages(Duration::from_millis(120))
@@ -1201,6 +1228,7 @@ impl RaLspSession {
         RaSessionCounters {
             content_modified_retries_total: self.content_modified_retries_total,
             request_timeouts_total: self.request_timeouts_total,
+            diagnostics_received_total: self.diagnostics_received_total,
         }
     }
 }
@@ -2214,7 +2242,7 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                     Ok(v) => v,
                     Err(_) => (Vec::new(), Vec::new(), Vec::new()),
                 };
-                let diagnostics = ra
+                let diagnostics = match ra
                     .extract_file_diagnostics(
                         &cfg.workspace_root,
                         &workspace_id,
@@ -2222,7 +2250,13 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                         &file_uri,
                     )
                     .await
-                    .unwrap_or_default();
+                {
+                    Ok(rows) => rows,
+                    Err(_) => {
+                        file_metrics.diagnostic_index_errors += 1;
+                        Vec::new()
+                    }
+                };
                 let counters_after = ra.session_counters();
                 file_metrics.content_modified_retries = counters_after
                     .content_modified_retries_total
@@ -2230,6 +2264,9 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
+                file_metrics.diagnostics_received = counters_after
+                    .diagnostics_received_total
+                    .saturating_sub(counters_before.diagnostics_received_total);
                 (
                     docs,
                     relations,
@@ -2248,6 +2285,9 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
+                file_metrics.diagnostics_received = counters_after
+                    .diagnostics_received_total
+                    .saturating_sub(counters_before.diagnostics_received_total);
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
                     Vec::new(),
@@ -2266,6 +2306,9 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 file_metrics.request_timeouts = counters_after
                     .request_timeouts_total
                     .saturating_sub(counters_before.request_timeouts_total);
+                file_metrics.diagnostics_received = counters_after
+                    .diagnostics_received_total
+                    .saturating_sub(counters_before.diagnostics_received_total);
                 let _ = err;
                 (
                     extract_symbol_docs_heuristic(&workspace_id, &file_rel, &file_uri, &content),
@@ -2446,11 +2489,16 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
                 vectors: debug_oversize_named_vectors(&doc.id, diagnostic_named_vectors(doc)),
             })
             .collect::<Vec<_>>();
-        services
+        if let Err(err) = services
             .diagnostic_store
             .insert_documents_with_named_vectors(diagnostic_rows)
             .await
-            .with_context(|| format!("qdrant diagnostic upsert failed for {}", file_rel))?;
+        {
+            let mut state = app.state.write().await;
+            state.extraction_metrics.diagnostic_index_errors_total += 1;
+            return Err(err)
+                .with_context(|| format!("qdrant diagnostic upsert failed for {}", file_rel));
+        }
     }
     if !semantic_token_docs.is_empty() {
         let semantic_rows = semantic_token_docs
@@ -2591,16 +2639,20 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
             .await
             .with_context(|| format!("qdrant type-edge stale delete failed for {}", file_rel))?;
     }
-    let stale_diagnostic_ids = previous_diagnostic_ids
-        .difference(&final_diagnostic_ids)
-        .cloned()
-        .collect::<Vec<_>>();
+    let stale_diagnostic_ids = stale_diagnostic_ids(&previous_diagnostic_ids, &diagnostics);
+    file_metrics.diagnostics_deleted = stale_diagnostic_ids.len() as u64;
     if !stale_diagnostic_ids.is_empty() {
-        services
+        if let Err(err) = services
             .diagnostic_store
             .delete_documents_by_ids(&stale_diagnostic_ids)
             .await
-            .with_context(|| format!("qdrant diagnostic stale delete failed for {}", file_rel))?;
+        {
+            let mut state = app.state.write().await;
+            state.extraction_metrics.diagnostic_index_errors_total += 1;
+            return Err(err).with_context(|| {
+                format!("qdrant diagnostic stale delete failed for {}", file_rel)
+            });
+        }
     }
     let stale_semantic_ids = previous_semantic_ids
         .difference(&final_semantic_ids)
@@ -2739,6 +2791,9 @@ async fn reindex_file(app: &App, services: &Services, path: &Path, bulk_mode: bo
     metrics.inlay_hints_failed_total += file_metrics.inlay_hints_failed;
     metrics.inlay_hints_nonempty_total += file_metrics.inlay_hints_nonempty;
     metrics.diagnostics_indexed_total += file_metrics.diagnostics_indexed as u64;
+    metrics.diagnostics_received_total += file_metrics.diagnostics_received;
+    metrics.diagnostics_deleted_total += file_metrics.diagnostics_deleted;
+    metrics.diagnostic_index_errors_total += file_metrics.diagnostic_index_errors;
 
     Ok(())
 }
@@ -2890,11 +2945,18 @@ async fn delete_file_chunks(app: &App, path: &Path) -> Result<()> {
     }
     if !diagnostic_ids_to_delete.is_empty() {
         let services = app.services.read().await.clone();
-        services
+        if let Err(err) = services
             .diagnostic_store
             .delete_documents_by_ids(&diagnostic_ids_to_delete)
             .await
-            .with_context(|| format!("qdrant diagnostic delete failed for {}", file_rel))?;
+        {
+            let mut state = app.state.write().await;
+            state.extraction_metrics.diagnostic_index_errors_total += 1;
+            return Err(err)
+                .with_context(|| format!("qdrant diagnostic delete failed for {}", file_rel));
+        }
+        let mut state = app.state.write().await;
+        state.extraction_metrics.diagnostics_deleted_total += diagnostic_ids_to_delete.len() as u64;
     }
     if !semantic_ids_to_delete.is_empty() {
         let services = app.services.read().await.clone();
@@ -3469,7 +3531,8 @@ fn type_edge_named_vectors(doc: &schema::TypeEdge) -> HashMap<String, String> {
 
 fn diagnostic_search_text(doc: &schema::DiagnosticDoc) -> String {
     format!(
-        "diagnostic\nseverity: {severity}\ncode: {code}\nmessage: {message}\nfile: {file_path}\nworkspace_id: {workspace_id}",
+        "diagnostic\nsource: {source}\nseverity: {severity}\ncode: {code}\nmessage: {message}\nfile: {file_path}\nworkspace_id: {workspace_id}",
+        source = doc.source,
         severity = doc.severity,
         code = doc.code.clone().unwrap_or_default(),
         message = doc.message,
@@ -3759,6 +3822,7 @@ fn build_diagnostic_docs_from_lsp(
                     ))
                 ),
                 workspace_id: workspace_id.to_string(),
+                source: "rust_analyzer".to_string(),
                 file_path: file_rel.to_string(),
                 uri: file_uri.to_string(),
                 severity,
@@ -3793,6 +3857,20 @@ fn lsp_diagnostic_code_to_string(code: Option<&Value>) -> Option<String> {
         return Some(value.to_string());
     }
     code.as_i64().map(|value| value.to_string())
+}
+
+fn stale_diagnostic_ids(
+    previous_ids: &HashSet<String>,
+    current_docs: &[schema::DiagnosticDoc],
+) -> Vec<String> {
+    let current_ids = current_docs
+        .iter()
+        .map(|doc| doc.id.clone())
+        .collect::<HashSet<_>>();
+    previous_ids
+        .difference(&current_ids)
+        .cloned()
+        .collect::<Vec<_>>()
 }
 
 fn build_crate_metadata_docs(
@@ -5374,7 +5452,10 @@ async fn read_lsp_response_for_id<R>(
     expected_id: i64,
     work_done_in_flight: &mut usize,
     saw_work_done_progress: &mut bool,
-    diagnostics_by_uri: &mut HashMap<String, Vec<Value>>,
+    diagnostics_by_uri: &mut HashMap<String, Vec<schema::DiagnosticDoc>>,
+    workspace_root: &Path,
+    workspace_id: &str,
+    diagnostics_received_total: &mut u64,
 ) -> Result<Value>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -5386,6 +5467,9 @@ where
             work_done_in_flight,
             saw_work_done_progress,
             diagnostics_by_uri,
+            workspace_root,
+            workspace_id,
+            diagnostics_received_total,
         );
         if msg.get("id").and_then(Value::as_i64) != Some(expected_id) {
             continue;
@@ -5403,17 +5487,26 @@ fn update_lsp_side_channel_state(
     msg: &Value,
     in_flight: &mut usize,
     saw_progress: &mut bool,
-    diagnostics_by_uri: &mut HashMap<String, Vec<Value>>,
+    diagnostics_by_uri: &mut HashMap<String, Vec<schema::DiagnosticDoc>>,
+    workspace_root: &Path,
+    workspace_id: &str,
+    diagnostics_received_total: &mut u64,
 ) {
     if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
         && let Some(params) = msg.get("params")
         && let Some(uri) = params.get("uri").and_then(Value::as_str)
     {
-        let diagnostics = params
+        let diagnostics_payload = params
             .get("diagnostics")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let file_path = uri_to_workspace_relative_path(workspace_root, uri)
+            .or_else(|| file_uri_to_path(uri).map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let diagnostics =
+            build_diagnostic_docs_from_lsp(workspace_id, &file_path, uri, &diagnostics_payload);
+        *diagnostics_received_total += diagnostics.len() as u64;
         diagnostics_by_uri.insert(uri.to_string(), diagnostics);
     }
 
@@ -6554,6 +6647,7 @@ where
         );
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].severity, "error");
+        assert_eq!(docs[0].source, "rust_analyzer");
         assert_eq!(docs[0].code.as_deref(), Some("E0308"));
         assert_eq!(docs[0].span.start_line, 10);
         assert_eq!(docs[0].span.end_line, 10);
@@ -6563,7 +6657,9 @@ where
     fn update_lsp_side_channel_state_tracks_publish_diagnostics() {
         let mut in_flight = 0usize;
         let mut saw_progress = false;
-        let mut diagnostics_by_uri = HashMap::<String, Vec<Value>>::new();
+        let mut diagnostics_by_uri = HashMap::<String, Vec<schema::DiagnosticDoc>>::new();
+        let mut diagnostics_received_total = 0_u64;
+        let workspace_root = Path::new("/tmp/ws");
 
         update_lsp_side_channel_state(
             &json!({
@@ -6586,6 +6682,9 @@ where
             &mut in_flight,
             &mut saw_progress,
             &mut diagnostics_by_uri,
+            workspace_root,
+            "ws_test",
+            &mut diagnostics_received_total,
         );
 
         assert_eq!(
@@ -6594,5 +6693,157 @@ where
                 .map(std::vec::Vec::len),
             Some(1)
         );
+        assert_eq!(diagnostics_received_total, 1);
+    }
+
+    #[test]
+    fn update_lsp_side_channel_state_replaces_latest_pass_and_clears_on_empty() {
+        let mut in_flight = 0usize;
+        let mut saw_progress = false;
+        let mut diagnostics_by_uri = HashMap::<String, Vec<schema::DiagnosticDoc>>::new();
+        let mut diagnostics_received_total = 0_u64;
+        let workspace_root = Path::new("/tmp/ws");
+
+        update_lsp_side_channel_state(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": "file:///tmp/ws/src/lib.rs",
+                    "diagnostics": [{
+                        "severity": 1,
+                        "message": "first error",
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 3 }
+                        }
+                    }]
+                }
+            }),
+            &mut in_flight,
+            &mut saw_progress,
+            &mut diagnostics_by_uri,
+            workspace_root,
+            "ws_test",
+            &mut diagnostics_received_total,
+        );
+
+        update_lsp_side_channel_state(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": "file:///tmp/ws/src/lib.rs",
+                    "diagnostics": [{
+                        "severity": 2,
+                        "message": "second warning",
+                        "range": {
+                            "start": { "line": 2, "character": 0 },
+                            "end": { "line": 2, "character": 4 }
+                        }
+                    }]
+                }
+            }),
+            &mut in_flight,
+            &mut saw_progress,
+            &mut diagnostics_by_uri,
+            workspace_root,
+            "ws_test",
+            &mut diagnostics_received_total,
+        );
+
+        let second_pass = diagnostics_by_uri
+            .get("file:///tmp/ws/src/lib.rs")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(second_pass.len(), 1);
+        assert_eq!(second_pass[0].message, "second warning");
+
+        update_lsp_side_channel_state(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": "file:///tmp/ws/src/lib.rs",
+                    "diagnostics": []
+                }
+            }),
+            &mut in_flight,
+            &mut saw_progress,
+            &mut diagnostics_by_uri,
+            workspace_root,
+            "ws_test",
+            &mut diagnostics_received_total,
+        );
+
+        assert_eq!(
+            diagnostics_by_uri
+                .get("file:///tmp/ws/src/lib.rs")
+                .map(std::vec::Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn build_diagnostic_docs_from_lsp_produces_stable_ids_for_identical_payload() {
+        let payload = vec![json!({
+            "severity": 1,
+            "code": "E0308",
+            "message": "mismatched types",
+            "range": {
+                "start": { "line": 4, "character": 2 },
+                "end": { "line": 4, "character": 8 }
+            }
+        })];
+        let first = build_diagnostic_docs_from_lsp(
+            "ws_test",
+            "src/lib.rs",
+            "file:///tmp/ws/src/lib.rs",
+            &payload,
+        );
+        let second = build_diagnostic_docs_from_lsp(
+            "ws_test",
+            "src/lib.rs",
+            "file:///tmp/ws/src/lib.rs",
+            &payload,
+        );
+        assert_eq!(first[0].id, second[0].id);
+    }
+
+    #[test]
+    fn stale_diagnostic_ids_excludes_current_latest_ids() {
+        let first = build_diagnostic_docs_from_lsp(
+            "ws_test",
+            "src/lib.rs",
+            "file:///tmp/ws/src/lib.rs",
+            &[json!({
+                "severity": 1,
+                "message": "first error",
+                "range": {
+                    "start": { "line": 1, "character": 0 },
+                    "end": { "line": 1, "character": 1 }
+                }
+            })],
+        );
+        let second = build_diagnostic_docs_from_lsp(
+            "ws_test",
+            "src/lib.rs",
+            "file:///tmp/ws/src/lib.rs",
+            &[json!({
+                "severity": 2,
+                "message": "second warning",
+                "range": {
+                    "start": { "line": 2, "character": 0 },
+                    "end": { "line": 2, "character": 1 }
+                }
+            })],
+        );
+        let previous_ids = first
+            .iter()
+            .map(|doc| doc.id.clone())
+            .collect::<HashSet<_>>();
+        let stale = stale_diagnostic_ids(&previous_ids, &second);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0], first[0].id);
     }
 }
