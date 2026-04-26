@@ -22,6 +22,9 @@ pub mod google;
 #[cfg(all(feature = "groq", not(target_arch = "wasm32")))]
 pub mod groq;
 
+#[cfg(all(feature = "llama_cpp", not(target_arch = "wasm32")))]
+pub mod llama_cpp;
+
 #[cfg(all(feature = "azure_openai", not(target_arch = "wasm32")))]
 pub mod azure_openai;
 

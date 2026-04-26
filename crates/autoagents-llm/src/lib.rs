@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
         feature = "phind",
         feature = "google",
         feature = "groq",
+        feature = "llama_cpp",
         feature = "azure_openai",
         feature = "openrouter",
         feature = "minimax"

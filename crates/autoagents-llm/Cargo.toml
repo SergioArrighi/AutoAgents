@@ -20,6 +20,7 @@ full = [
     "phind",
     "google",
     "groq",
+    "llama_cpp",
     "azure_openai",
     "openrouter",
     "minimax",
@@ -33,6 +34,7 @@ xai = []
 phind = []
 google = []
 groq = []
+llama_cpp = []
 azure_openai = []
 openrouter = []
 minimax = []
